@@ -1,0 +1,199 @@
+<!DOCTYPE html>
+<html lang="en" dir="ltr">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AtlasMeat</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+
+<!-- ===== Join ===== -->
+<div id="joinScreen" class="join-screen">
+  <div class="join-card">
+    <div class="join-logo">AtlasMeat</div>
+    <h1>Sign in</h1>
+    <p class="join-sub">Pick a name to enter the voice room.</p>
+    <input id="nameInput" type="text" maxlength="24" placeholder="Your name" autocomplete="off" />
+    <button id="joinBtn" class="btn-primary">Join</button>
+    <p id="joinError" class="join-error"></p>
+    <p class="join-hint">Chrome or Edge recommended. Microphone access is required to talk.</p>
+  </div>
+</div>
+
+<!-- ===== App ===== -->
+<div id="app" class="app hidden">
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">AtlasMeat</div>
+
+    <div class="side-head">
+      <span>Voice channels</span>
+      <button id="addChannelBtn" class="icon-btn" title="New channel" aria-label="New channel">
+        <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>
+      </button>
+    </div>
+
+    <div id="newChannelRow" class="new-channel hidden">
+      <input id="newChannelInput" maxlength="32" placeholder="Channel name" autocomplete="off" />
+      <button id="createChannelBtn" class="btn-primary btn-sm">Add</button>
+    </div>
+
+    <div id="channelList" class="channel-list"></div>
+
+    <div class="me-panel">
+      <div class="me-avatar" id="meAvatar">?</div>
+      <div class="me-info">
+        <div class="me-name" id="meName">—</div>
+        <div class="me-status" id="meStatus">Online</div>
+      </div>
+      <button id="meMicBtn" class="icon-btn" title="Mute">
+        <svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg>
+      </button>
+      <button id="meDeafenBtn" class="icon-btn" title="Deafen">
+        <svg viewBox="0 0 24 24"><path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="3" y="14" width="4" height="6" rx="1.5"/><rect x="17" y="14" width="4" height="6" rx="1.5"/></svg>
+      </button>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main">
+    <header class="main-header">
+      <div class="ch-title">
+        <svg class="ch-ico" viewBox="0 0 24 24"><path d="M4 9h3l4-4v14l-4-4H4z"/><path d="M16 8.5a5 5 0 0 1 0 7"/><path d="M19 6a9 9 0 0 1 0 12"/></svg>
+        <span id="channelTitle">No channel</span>
+      </div>
+      <div class="ch-meta">
+        <span id="memberCount" class="pill hidden"></span>
+        <span id="shareBadge" class="pill pill-live hidden">Live</span>
+      </div>
+    </header>
+
+    <div id="stageEmpty" class="stage-empty">
+      <h2>Pick a channel</h2>
+      <p>Join a voice channel from the left to start.</p>
+    </div>
+
+    <div id="stage" class="stage hidden">
+      <div id="shares" class="shares"></div>
+      <div id="tiles" class="tiles"></div>
+    </div>
+
+    <div id="controlBar" class="control-bar hidden">
+      <button id="micBtn" class="ctrl" title="Mute">
+        <span class="ctrl-ico"><svg viewBox="0 0 24 24"><path d="M12 3a3 3 0 0 0-3 3v6a3 3 0 0 0 6 0V6a3 3 0 0 0-3-3z"/><path d="M5 11a7 7 0 0 0 14 0"/><path d="M12 18v3"/></svg></span>
+        <span class="ctrl-label">Mic</span>
+      </button>
+      <button id="deafenBtn" class="ctrl" title="Deafen">
+        <span class="ctrl-ico"><svg viewBox="0 0 24 24"><path d="M4 14v-2a8 8 0 0 1 16 0v2"/><rect x="3" y="14" width="4" height="6" rx="1.5"/><rect x="17" y="14" width="4" height="6" rx="1.5"/></svg></span>
+        <span class="ctrl-label">Deafen</span>
+      </button>
+      <button id="screenBtn" class="ctrl" title="Share screen">
+        <span class="ctrl-ico"><svg viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/></svg></span>
+        <span class="ctrl-label">Share</span>
+      </button>
+      <button id="qualityBtn" class="ctrl" title="Settings">
+        <span class="ctrl-ico"><svg viewBox="0 0 24 24"><path d="M4 7h7M15 7h5M4 12h11M19 12h1M4 17h4M12 17h8"/><circle cx="13" cy="7" r="2"/><circle cx="17" cy="12" r="2"/><circle cx="10" cy="17" r="2"/></svg></span>
+        <span class="ctrl-label">Settings</span>
+      </button>
+      <button id="leaveBtn" class="ctrl ctrl-danger" title="Leave channel">
+        <span class="ctrl-ico"><svg viewBox="0 0 24 24"><path d="M10 21H6a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="M16 17l5-5-5-5"/><path d="M21 12H9"/></svg></span>
+        <span class="ctrl-label">Leave</span>
+      </button>
+    </div>
+  </main>
+
+  <!-- Chat -->
+  <aside class="chat">
+    <div class="chat-head"><span id="chatTitle">Chat</span></div>
+    <div id="messages" class="messages"></div>
+    <form id="chatForm" class="chat-form" autocomplete="off">
+      <input id="chatInput" maxlength="1000" placeholder="Select a channel" disabled />
+      <button type="submit" class="btn-primary btn-sm" id="chatSend" disabled>Send</button>
+    </form>
+  </aside>
+</div>
+
+<!-- ===== Settings modal ===== -->
+<div id="qualityModal" class="modal hidden">
+  <div class="modal-card">
+    <div class="modal-head">
+      <h3>Settings</h3>
+      <button id="qualityClose" class="icon-btn" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+
+    <section class="group">
+      <h4>Screen quality</h4>
+      <label class="field">
+        <span>Resolution</span>
+        <select id="qualityRes">
+          <option value="1280x720">720p</option>
+          <option value="1920x1080" selected>1080p</option>
+          <option value="2560x1440">1440p</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Frame rate</span>
+        <select id="qualityFps">
+          <option value="15">15 FPS</option>
+          <option value="30" selected>30 FPS</option>
+          <option value="60">60 FPS</option>
+        </select>
+      </label>
+      <label class="field">
+        <span>Bitrate <b id="bitrateVal">6 Mbps</b></span>
+        <input id="qualityBitrate" type="range" min="500" max="50000" step="500" value="6000" />
+      </label>
+      <p class="field-note">Changes apply while sharing, without interruption.</p>
+    </section>
+
+    <section class="group">
+      <h4>Microphone</h4>
+      <label class="field">
+        <span>Input device</span>
+        <select id="micSelect"></select>
+      </label>
+      <label class="check"><input type="checkbox" id="procEC" /><span>Echo cancellation</span></label>
+      <label class="check"><input type="checkbox" id="procNS" /><span>Noise suppression</span></label>
+      <label class="check"><input type="checkbox" id="procAGC" /><span>Auto gain control</span></label>
+      <p class="field-note">Leave off for a raw mic. Applies after Apply.</p>
+    </section>
+
+    <section class="group">
+      <h4>Hotkeys</h4>
+      <p class="field-note" style="margin-top:0">Off by default. Press Set, then press a key.</p>
+      <div class="hk-row">
+        <label class="check" style="flex:1"><input type="checkbox" id="hkMuteEn"><span>Mute</span></label>
+        <span class="hk-key" id="hkMuteKey">Not set</span>
+        <button class="btn-sm hk-set" data-hk="mute">Set</button>
+      </div>
+      <div class="hk-row">
+        <label class="check" style="flex:1"><input type="checkbox" id="hkDeafenEn"><span>Deafen</span></label>
+        <span class="hk-key" id="hkDeafenKey">Not set</span>
+        <button class="btn-sm hk-set" data-hk="deafen">Set</button>
+      </div>
+      <div class="hk-row">
+        <label class="check" style="flex:1"><input type="checkbox" id="hkPttEn"><span>Push to talk</span></label>
+        <span class="hk-key" id="hkPttKey">Not set</span>
+        <button class="btn-sm hk-set" data-hk="ptt">Set</button>
+      </div>
+    </section>
+
+    <section class="group">
+      <h4>Notifications</h4>
+      <label class="check"><input type="checkbox" id="notifSoundEn" checked><span>Chat sound while the tab is in the background</span></label>
+    </section>
+
+    <button id="qualityApply" class="btn-primary">Apply</button>
+  </div>
+</div>
+
+<div id="remoteAudios" aria-hidden="true" style="position:absolute;left:-9999px;width:1px;height:1px;overflow:hidden"></div>
+<div id="toasts" class="toasts"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
