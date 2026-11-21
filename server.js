@@ -13,6 +13,50 @@ app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
 app.get('/favicon.ico', (req, res) => res.status(204).end());
 
+// ---- TURN credentials (Cloudflare Realtime TURN, free tier) ----
+// Set CF_TURN_KEY_ID and CF_TURN_API_TOKEN in the environment (Render → Environment).
+// Without them the app still works, but only STUN is used and strict NATs may fail.
+const CF_TURN_KEY_ID = process.env.CF_TURN_KEY_ID || '';
+const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN || '';
+const TURN_TTL = 86400; // seconds
+let turnCache = null; // { iceServers, expires }
+
+app.get('/turn', async (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  if (!CF_TURN_KEY_ID || !CF_TURN_API_TOKEN) {
+    return res.json({ iceServers: [] });
+  }
+  if (turnCache && turnCache.expires > Date.now()) {
+    return res.json({ iceServers: turnCache.iceServers });
+  }
+  try {
+    const r = await fetch(
+      `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(CF_TURN_KEY_ID)}/credentials/generate`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${CF_TURN_API_TOKEN}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ ttl: TURN_TTL }),
+      }
+    );
+    if (!r.ok) {
+      console.error('TURN credentials failed:', r.status, await r.text());
+      return res.json({ iceServers: [] });
+    }
+    const data = await r.json();
+    // Cloudflare returns { iceServers: { urls: [...], username, credential } }
+    const ice = data && data.iceServers ? data.iceServers : null;
+    const list = ice ? (Array.isArray(ice) ? ice : [ice]) : [];
+    turnCache = { iceServers: list, expires: Date.now() + (TURN_TTL - 300) * 1000 };
+    res.json({ iceServers: list });
+  } catch (e) {
+    console.error('TURN credentials error:', e.message);
+    res.json({ iceServers: [] });
+  }
+});
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 

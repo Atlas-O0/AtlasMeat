@@ -570,11 +570,35 @@ function setLocalSpeaking(v) {
 }
 
 /* ---------------- webrtc mesh ---------------- */
-const RTC_CONFIG = {
-  iceServers: [
-    { urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302'] },
-  ],
-};
+// More STUN servers (Google STUN is often blocked on some networks).
+// A TURN relay can be added in public/rtc-config.js for symmetric NATs.
+const ICE_SERVERS = [
+  {
+    urls: [
+      'stun:stun.cloudflare.com:3478',
+      'stun:stun.l.google.com:19302',
+      'stun:stun1.l.google.com:19302',
+      'stun:stun.services.mozilla.com',
+    ],
+  },
+];
+if (window.ATLAS_TURN) ICE_SERVERS.push(window.ATLAS_TURN);
+const RTC_CONFIG = { iceServers: ICE_SERVERS };
+
+// Fetch TURN credentials from the server (Cloudflare TURN relay).
+// Fixes "connected but no audio" when both users are behind strict NATs.
+async function loadTurnServers() {
+  try {
+    const res = await fetch('/turn', { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    const list = Array.isArray(data.iceServers)
+      ? data.iceServers
+      : (data.iceServers ? [data.iceServers] : []);
+    list.forEach((s) => { if (s && s.urls) ICE_SERVERS.push(s); });
+  } catch (_) { /* relay is optional */ }
+}
+loadTurnServers();
 function sendSignal(to, data) { send({ type: 'signal', to, data }); }
 function nameOf(id) {
   const u = state.users.find((x) => x.id === id);
