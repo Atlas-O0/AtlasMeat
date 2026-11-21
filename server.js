@@ -25,6 +25,18 @@ let meteredCache = null; // { iceServers, expires }
 app.get('/turn', async (req, res) => {
   res.set('Cache-Control', 'no-store');
 
+  // Generic TURN relay (e.g. your own coturn on an Iranian VPS).
+  // TURN_URL is a comma-separated list of turn:/turns: URLs.
+  const gUrl = process.env.TURN_URL || '';
+  const gUser = process.env.TURN_USERNAME || '';
+  const gPass = process.env.TURN_PASSWORD || '';
+  if (gUrl && gUser && gPass) {
+    const urls = gUrl.split(',').map((s) => s.trim()).filter(Boolean);
+    if (urls.length) {
+      return res.json({ iceServers: [{ urls, username: gUser, credential: gPass }] });
+    }
+  }
+
   // Metered Open Relay (free 20 GB/month, no card). Tries a Middle East PoP
   // first so Iranian users get a much shorter relay path than Europe.
   const mKey = process.env.METERED_API_KEY || '';
