@@ -23,6 +23,28 @@ let turnCache = null; // { iceServers, expires }
 
 app.get('/turn', async (req, res) => {
   res.set('Cache-Control', 'no-store');
+
+  // ExpressTURN free plan (1 TB/month, email signup, no card).
+  // Set EXPRESSTURN_USERNAME and EXPRESSTURN_PASSWORD in the environment.
+  const eu = process.env.EXPRESSTURN_USERNAME || '';
+  const ep = process.env.EXPRESSTURN_PASSWORD || '';
+  if (eu && ep) {
+    return res.json({
+      iceServers: [
+        {
+          urls: [
+            'turn:free.expressturn.com:3478?transport=udp',
+            'turn:free.expressturn.com:3478?transport=tcp',
+            'turn:free.expressturn.com:80?transport=tcp',
+            'turn:free.expressturn.com:443?transport=tcp',
+          ],
+          username: eu,
+          credential: ep,
+        },
+      ],
+    });
+  }
+
   if (!CF_TURN_KEY_ID || !CF_TURN_API_TOKEN) {
     return res.json({ iceServers: [] });
   }
