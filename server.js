@@ -20,9 +20,37 @@ const CF_TURN_KEY_ID = process.env.CF_TURN_KEY_ID || '';
 const CF_TURN_API_TOKEN = process.env.CF_TURN_API_TOKEN || '';
 const TURN_TTL = 86400; // seconds
 let turnCache = null; // { iceServers, expires }
+let meteredCache = null; // { iceServers, expires }
 
 app.get('/turn', async (req, res) => {
   res.set('Cache-Control', 'no-store');
+
+  // Metered Open Relay (free 20 GB/month, no card). Tries a Middle East PoP
+  // first so Iranian users get a much shorter relay path than Europe.
+  const mKey = process.env.METERED_API_KEY || '';
+  const mApp = process.env.METERED_APP || '';
+  const mRegion = process.env.METERED_REGION || 'middle_east';
+  if (mKey && mApp) {
+    if (meteredCache && meteredCache.expires > Date.now()) {
+      return res.json({ iceServers: meteredCache.iceServers });
+    }
+    try {
+      const u = `https://${mApp}.metered.live/api/v1/turn/credentials` +
+        `?apiKey=${encodeURIComponent(mKey)}&region=${encodeURIComponent(mRegion)}`;
+      const r = await fetch(u);
+      if (r.ok) {
+        const list = await r.json();
+        if (Array.isArray(list) && list.length) {
+          meteredCache = { iceServers: list, expires: Date.now() + 30 * 60 * 1000 };
+          return res.json({ iceServers: list });
+        }
+      } else {
+        console.error('Metered TURN failed:', r.status, await r.text());
+      }
+    } catch (e) {
+      console.error('Metered TURN error:', e.message);
+    }
+  }
 
   // ExpressTURN free plan (1 TB/month, email signup, no card).
   // Set EXPRESSTURN_USERNAME and EXPRESSTURN_PASSWORD in the environment.
