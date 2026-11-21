@@ -30,23 +30,26 @@ app.get('/turn', async (req, res) => {
     return res.json({ iceServers: turnCache.iceServers });
   }
   try {
-    const r = await fetch(
-      `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(CF_TURN_KEY_ID)}/credentials/generate`,
-      {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${CF_TURN_API_TOKEN}`,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ ttl: TURN_TTL }),
-      }
-    );
+    const keyUrl = `https://rtc.live.cloudflare.com/v1/turn/keys/${encodeURIComponent(CF_TURN_KEY_ID)}`;
+    const payload = {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${CF_TURN_API_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ ttl: TURN_TTL }),
+    };
+    // Current Cloudflare API path; fall back to the older one if needed.
+    let r = await fetch(`${keyUrl}/credentials/generate-ice-servers`, payload);
+    if (r.status === 404) {
+      r = await fetch(`${keyUrl}/credentials/generate`, payload);
+    }
     if (!r.ok) {
       console.error('TURN credentials failed:', r.status, await r.text());
       return res.json({ iceServers: [] });
     }
     const data = await r.json();
-    // Cloudflare returns { iceServers: { urls: [...], username, credential } }
+    // Cloudflare returns { iceServers: [ {urls:[...]}, {urls:[...], username, credential} ] }
     const ice = data && data.iceServers ? data.iceServers : null;
     const list = ice ? (Array.isArray(ice) ? ice : [ice]) : [];
     turnCache = { iceServers: list, expires: Date.now() + (TURN_TTL - 300) * 1000 };
