@@ -1379,6 +1379,24 @@ $('#deafenBtn').addEventListener('click', toggleDeafen);
 $('#meDeafenBtn').addEventListener('click', toggleDeafen);
 $('#screenBtn').addEventListener('click', toggleScreen);
 $('#leaveBtn').addEventListener('click', () => leaveChannel());
+
+/* user panel → settings menu */
+function closeMeMenu() { $('#meMenu').classList.add('hidden'); }
+$('#mePanel').addEventListener('click', (e) => {
+  if (e.target.closest('#meMicBtn') || e.target.closest('#meDeafenBtn') || e.target.closest('#meMenu')) return;
+  $('#meMenu').classList.toggle('hidden');
+});
+$('#meMenuSettings').addEventListener('click', (e) => {
+  e.stopPropagation();
+  closeMeMenu();
+  openQuality();
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('#mePanel')) closeMeMenu();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeMeMenu();
+});
 // Hotkeys (disabled by default, user sets them in Settings)
 function isTypingTarget(el) {
   return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
