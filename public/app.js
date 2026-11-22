@@ -750,6 +750,10 @@ function onRemoteTrack(p, e) {
     renderShares();
     renderTiles();
   } else if (track.kind === 'audio') {
+    // Lower the playout buffer to cut call delay (default can be ~200 ms).
+    try {
+      if (e.receiver && 'jitterBufferTarget' in e.receiver) e.receiver.jitterBufferTarget = 0;
+    } catch (_) {}
     // Two audio tracks max: mic + share-audio. First arrival is the mic, and its
     // slot is never taken over by the share track (that used to kill the mic).
     const isMicSlot = !!p.remoteAudioTrack && p.remoteAudioTrack.id === track.id;
@@ -805,15 +809,10 @@ function setupRemoteAudio(p, track, isShare) {
     audio.playsInline = true;
     audio.controls = false;
     const vol = state.deafened ? 0 : getVolume(p.name);
-    // Use Web Audio gain for the full 0-400% range when possible, otherwise clamp to 1
-    let useGain = false;
-    const ctx = ensureAudio();
-    if (ctx && ctx.state === 'running' && vol !== 1) useGain = true;
-    if (useGain) {
-      audio.volume = 1;
-    } else {
-      audio.volume = Math.min(1, vol);
-    }
+    // Only route through Web Audio when boosting above 100%. Normal listening
+    // uses the <audio> element directly, which avoids extra output latency.
+    const boost = vol > 1;
+    audio.volume = boost ? 1 : Math.min(1, vol);
     audio.muted = !!state.deafened;
     audio.srcObject = new MediaStream([track]);
     const container = document.getElementById('remoteAudios');
@@ -832,22 +831,24 @@ function setupRemoteAudio(p, track, isShare) {
     if (isShare) p.shareAudioEl = audio;
     else p.audioEl = audio;
 
-    // Always create a gain node when context is available so 100-400% has real effect
-    if (ctx) {
-      try {
-        // Must resume first
-        if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
-        const src = ctx.createMediaElementSource(audio);
-        const gain = ctx.createGain();
-        gain.gain.value = vol;
-        src.connect(gain);
-        gain.connect(ctx.destination);
-        if (isShare) { p.shareSrc = src; p.shareGain = gain; }
-        else { p.audioSrc = src; p.audioGain = gain; }
-        // Keep audio.volume at 1 when using gain, so gain controls the full range
-        if (useGain) audio.volume = 1;
-      } catch (_) {
-        // If MediaElementSource fails (e.g. already connected), fallback to plain audio.volume
+    // Web Audio gain is only needed for the 100–400% boost range.
+    if (boost) {
+      const ctx = ensureAudio();
+      if (ctx) {
+        try {
+          if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
+          const src = ctx.createMediaElementSource(audio);
+          const gain = ctx.createGain();
+          gain.gain.value = vol;
+          src.connect(gain);
+          gain.connect(ctx.destination);
+          audio.volume = 1;
+          if (isShare) { p.shareSrc = src; p.shareGain = gain; }
+          else { p.audioSrc = src; p.audioGain = gain; }
+        } catch (_) {
+          // If MediaElementSource fails, fall back to plain audio.volume.
+          audio.volume = 1;
+        }
       }
     }
   } catch (e) { console.warn('audio element', e); }
@@ -1132,10 +1133,10 @@ function renderTiles() {
           // For audio elements, volume is 0..1, so scale 0-400% to 0-1 with a curve for better sensitivity
           // Use a more sensitive curve: 0-100% = 0-1 linear, 100-400% = 1 + boost via GainNode
           if (p.audioEl) {
-            p.audioEl.volume = Math.min(1, v > 1 ? 1 : v);
-            // If we have a gain node, use it for boost above 100%
-            if (p.audioGain) p.audioGain.gain.value = v;
-            else if (v > 1) {
+            if (p.audioGain) {
+              p.audioEl.volume = 1;
+              p.audioGain.gain.value = v;
+            } else if (v > 1) {
               // Try to create gain boost on the fly if not exists
               try {
                 const ctx = ensureAudio();
@@ -1145,13 +1146,20 @@ function renderTiles() {
                   gain.gain.value = v;
                   src.connect(gain); gain.connect(ctx.destination);
                   p.audioSrc = src; p.audioGain = gain;
+                  p.audioEl.volume = 1;
                 }
               } catch(_){}
+            } else {
+              p.audioEl.volume = Math.min(1, v);
             }
           }
           if (p.shareAudioEl) {
-            p.shareAudioEl.volume = Math.min(1, v > 1 ? 1 : v);
-            if (p.shareGain) p.shareGain.gain.value = v;
+            if (p.shareGain) {
+              p.shareAudioEl.volume = 1;
+              p.shareGain.gain.value = v;
+            } else {
+              p.shareAudioEl.volume = Math.min(1, v);
+            }
           }
           // Fallback for Web Audio only paths
           if (p.audioGain && !p.audioEl) p.audioGain.gain.value = v;
@@ -1355,8 +1363,8 @@ function toggleDeafen() {
   if (micTrack) micTrack.enabled = !(state.muted || state.deafened);
   state.peers.forEach((p) => {
     const v = state.deafened ? 0 : getVolume(p.name);
-    if (p.audioEl) { p.audioEl.volume = Math.min(1, v); p.audioEl.muted = state.deafened; }
-    if (p.shareAudioEl) { p.shareAudioEl.volume = Math.min(1, v); p.shareAudioEl.muted = state.deafened; }
+    if (p.audioEl) { p.audioEl.volume = p.audioGain ? 1 : Math.min(1, v); p.audioEl.muted = state.deafened; }
+    if (p.shareAudioEl) { p.shareAudioEl.volume = p.shareGain ? 1 : Math.min(1, v); p.shareAudioEl.muted = state.deafened; }
     if (p.audioGain) p.audioGain.gain.value = v;
     if (p.shareGain) p.shareGain.gain.value = v;
   });
