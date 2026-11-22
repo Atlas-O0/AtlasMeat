@@ -3,6 +3,7 @@
 
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 
@@ -137,6 +138,26 @@ function newChannelId() {
   return 'c' + Math.random().toString(36).slice(2, 8);
 }
 
+function normalizeName(raw) {
+  return String(raw || '').trim().replace(/\s+/g, ' ').slice(0, 24);
+}
+function hashPassword(password) {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const hash = crypto.scryptSync(password, salt, 32).toString('hex');
+  return `${salt}:${hash}`;
+}
+function verifyPassword(password, stored) {
+  try {
+    const [salt, hash] = String(stored || '').split(':');
+    if (!salt || !hash) return false;
+    const actual = crypto.scryptSync(String(password || ''), salt, 32);
+    const expected = Buffer.from(hash, 'hex');
+    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+  } catch (_) {
+    return false;
+  }
+}
+
 // Seed channels
 [
   ['c_lounge', 'Lounge'],
@@ -182,7 +203,7 @@ function publicUsers() {
   }));
 }
 function publicChannels() {
-  return [...channels.values()].map((c) => ({ id: c.id, name: c.name }));
+  return [...channels.values()].map((c) => ({ id: c.id, name: c.name, locked: !!c.passwordHash }));
 }
 function broadcastState() {
   broadcast({ type: 'state', users: publicUsers(), channels: publicChannels() });
@@ -197,13 +218,24 @@ function leaveChannel(user) {
   broadcastState();
 }
 
-function joinChannel(user, channelId) {
+function joinChannel(user, channelId, password) {
   const ch = channels.get(channelId);
   if (!ch) {
     send(user.ws, { type: 'error', message: 'Channel not found.' });
     return;
   }
   if (user.channelId === channelId) return;
+  if (ch.passwordHash) {
+    const pw = String(password || '');
+    if (!pw) {
+      send(user.ws, { type: 'channel-join-error', channelId, message: 'This channel is locked.' });
+      return;
+    }
+    if (!verifyPassword(pw, ch.passwordHash)) {
+      send(user.ws, { type: 'channel-join-error', channelId, message: 'Wrong password.' });
+      return;
+    }
+  }
   if (user.channelId) leaveChannel(user);
   user.channelId = channelId;
   const peers = channelMembers(channelId)
@@ -227,6 +259,9 @@ wss.on('connection', (ws) => {
   const user = {
     id: newUserId(),
     name: null,
+    nameKey: null,
+    clientId: null,
+    replaced: false,
     ws,
     channelId: null,
     muted: false,
@@ -242,11 +277,41 @@ wss.on('connection', (ws) => {
 
     switch (msg.type) {
       case 'join': {
-        const name = String(msg.name || '').trim().slice(0, 24) || 'User';
+        if (user.name) {
+          send(ws, { type: 'error', message: 'Already joined.' });
+          break;
+        }
+        const name = normalizeName(msg.name);
+        if (!name) {
+          send(ws, { type: 'join-error', message: 'Enter a name.' });
+          break;
+        }
+        const nameKey = name.toLowerCase();
+        const clientId = String(msg.clientId || '').slice(0, 64);
+        const existing = [...users.values()].find((u) => u.id !== user.id && u.nameKey === nameKey);
+        if (existing) {
+          // Same browser/tab reconnecting before the old socket was cleaned up:
+          // let it take over. A different client must pick another name.
+          if (clientId && existing.clientId && existing.clientId === clientId) {
+            existing.replaced = true;
+            if (existing.channelId) {
+              broadcastChannel(existing.channelId, { type: 'peer-left', peerId: existing.id }, existing.id);
+            }
+            send(existing.ws, { type: 'session-replaced', message: 'This session was opened somewhere else.' });
+            try { existing.ws.close(4001, 'session replaced'); } catch (_) {}
+            users.delete(existing.id);
+          } else {
+            send(ws, { type: 'join-error', message: 'That name is already in use. Pick another one.' });
+            break;
+          }
+        }
         user.name = name;
+        user.nameKey = nameKey;
+        user.clientId = clientId;
         send(ws, {
           type: 'welcome',
           id: user.id,
+          name: user.name,
           users: publicUsers(),
           channels: publicChannels(),
         });
@@ -256,10 +321,30 @@ wss.on('connection', (ws) => {
       case 'create-channel': {
         const name = String(msg.name || '').trim().slice(0, 32);
         if (!name) break;
+        const rawPassword = String(msg.password || '').slice(0, 128);
         const id = newChannelId();
-        channels.set(id, { id, name, messages: [] });
+        channels.set(id, {
+          id,
+          name,
+          messages: [],
+          passwordHash: rawPassword.trim() ? hashPassword(rawPassword) : null,
+        });
         broadcastState();
-        joinChannel(user, id);
+        joinChannel(user, id, rawPassword);
+        break;
+      }
+      case 'set-channel-password': {
+        const id = String(msg.channelId || '');
+        const ch = channels.get(id);
+        if (!ch) { send(ws, { type: 'error', message: 'Channel not found.' }); break; }
+        if (user.channelId !== id) {
+          send(ws, { type: 'error', message: 'Join the channel first to change its password.' });
+          break;
+        }
+        const rawPassword = String(msg.password || '').slice(0, 128);
+        ch.passwordHash = rawPassword.trim() ? hashPassword(rawPassword) : null;
+        broadcastState();
+        send(ws, { type: 'channel-password-set', channelId: id, locked: !!ch.passwordHash });
         break;
       }
       case 'rename-channel': {
@@ -296,7 +381,9 @@ wss.on('connection', (ws) => {
       }
       case 'join-channel': {
         if (!user.name) break;
-        if (typeof msg.channelId === 'string') joinChannel(user, msg.channelId);
+        if (typeof msg.channelId === 'string') {
+          joinChannel(user, msg.channelId, typeof msg.password === 'string' ? msg.password : '');
+        }
         break;
       }
       case 'leave-channel': {
@@ -351,6 +438,10 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
+    if (user.replaced) {
+      users.delete(user.id);
+      return;
+    }
     if (user.channelId) {
       const old = user.channelId;
       users.delete(user.id);

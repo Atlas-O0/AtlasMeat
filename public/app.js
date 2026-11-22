@@ -23,6 +23,8 @@ const ICON_PATHS = {
   screen: '<rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8M12 17v4"/>',
   pencil: '<path d="M4 20h4L20 8l-4-4L4 16z"/><path d="M14 6l4 4"/>',
   trash: '<path d="M4 7h16"/><path d="M9 7V5h6v2"/><path d="M6 7l1 13h10l1-13"/>',
+  lock: '<rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+  unlock: '<rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 0 1 7.5-2"/>',
 };
 function ic(name, size = 14, cls = '') {
   return `<svg viewBox="0 0 24 24" width="${size}" height="${size}"${cls ? ` class="${cls}"` : ''} fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">${ICON_PATHS[name] || ''}</svg>`;
@@ -54,8 +56,31 @@ const state = {
 };
 let myId = null;
 let ws = null;
+let wsGeneration = 0;
 let reconnectAttempts = 0;
 let reconnectTimer = null;
+const clientId = (() => {
+  try {
+    let v = sessionStorage.getItem('atlasmeat:clientId');
+    if (!v) {
+      v = (window.crypto && crypto.randomUUID)
+        ? crypto.randomUUID()
+        : 'cid_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+      sessionStorage.setItem('atlasmeat:clientId', v);
+    }
+    return v;
+  } catch (_) {
+    return 'cid_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+  }
+})();
+
+/* channel passwords are kept in memory only for the current page/session */
+const channelPasswords = new Map();
+let pendingJoinChannelId = null;
+let pendingJoinPassword = '';
+let pendingCreatedPassword = null; // null = no create pending, '' = created without a password
+let passModalChannelId = null;
+let passModalMode = 'join'; // 'join' | 'set'
 
 /* media */
 let audioCtx = null;
@@ -198,24 +223,33 @@ function send(msg) {
 
 function connect(name) {
   state.myName = name;
-  ws = new WebSocket(wsUrl());
+  const gen = ++wsGeneration;
+  const sock = new WebSocket(wsUrl());
+  ws = sock;
 
-  ws.onopen = () => {
+  sock.onopen = () => {
+    if (gen !== wsGeneration) return;
     reconnectAttempts = 0;
-    send({ type: 'join', name });
+    send({ type: 'join', name, clientId });
     pushUpdate();
   };
-  ws.onmessage = (ev) => {
+  sock.onmessage = (ev) => {
+    if (gen !== wsGeneration) return;
     let msg;
     try { msg = JSON.parse(ev.data); } catch (_) { return; }
     route(msg);
   };
-  ws.onclose = () => {
+  sock.onclose = (ev) => {
+    if (gen !== wsGeneration) return;
     if (!state.joined && !state.myName) return;
+    if (ev && ev.code === 4001) {
+      returnToJoin('This session was opened somewhere else.');
+      return;
+    }
     cleanupPeers();
     scheduleReconnect();
   };
-  ws.onerror = () => { try { ws.close(); } catch (_) {} };
+  sock.onerror = () => { try { sock.close(); } catch (_) {} };
 }
 
 function scheduleReconnect() {
@@ -228,15 +262,43 @@ function scheduleReconnect() {
   }, wait);
 }
 
+function releaseMic() {
+  try { if (micStream) micStream.getTracks().forEach((t) => t.stop()); } catch (_) {}
+  try { stopVAD(); } catch (_) {}
+  micStream = null;
+  micTrack = null;
+}
+
+function returnToJoin(message) {
+  state.joined = false;
+  state.myName = null;
+  try { leaveChannel(true); } catch (_) {}
+  releaseMic();
+  $('#app').classList.add('hidden');
+  $('#joinScreen').classList.remove('hidden');
+  $('#joinError').textContent = message || '';
+  $('#joinBtn').disabled = false;
+  try { if (ws) ws.close(); } catch (_) {}
+}
+
 function route(msg) {
   switch (msg.type) {
     case 'welcome':
       myId = msg.id;
       state.joined = true;
+      if (msg.name) state.myName = msg.name;
       state.users = msg.users || [];
       state.channels = msg.channels || [];
+      $('#joinError').textContent = '';
       enterApp();
-      if (state.channelId) send({ type: 'join-channel', channelId: state.channelId });
+      ensureMic().then(() => refreshMicList()).catch(() => {});
+      if (state.channelId) {
+        send({
+          type: 'join-channel',
+          channelId: state.channelId,
+          password: channelPasswords.get(state.channelId) || '',
+        });
+      }
       renderAll();
       break;
     case 'state':
@@ -246,6 +308,16 @@ function route(msg) {
       detectMemberChanges();
       break;
     case 'channel-joined':
+      if (pendingCreatedPassword !== null) {
+        if (pendingCreatedPassword) channelPasswords.set(msg.channelId, pendingCreatedPassword);
+        pendingCreatedPassword = null;
+      }
+      if (pendingJoinChannelId === msg.channelId && pendingJoinPassword) {
+        channelPasswords.set(msg.channelId, pendingJoinPassword);
+      }
+      pendingJoinChannelId = null;
+      pendingJoinPassword = '';
+      if (passModalMode === 'join' && passModalChannelId === msg.channelId) closeChannelPassword();
       state.channelId = msg.channelId;
       state.speaking.clear();
       setMessages(msg.history || []);
@@ -286,6 +358,8 @@ function route(msg) {
       }
       break;
     case 'channel-deleted': {
+      channelPasswords.delete(msg.channelId);
+      if (passModalChannelId === msg.channelId) closeChannelPassword();
       // If we were in the deleted channel, leave it
       if (state.channelId === msg.channelId) {
         toast('Channel was deleted.', true);
@@ -293,6 +367,29 @@ function route(msg) {
       }
       break;
     }
+    case 'channel-join-error':
+      if (passModalMode === 'join' && passModalChannelId === msg.channelId) {
+        $('#channelPassError').textContent = msg.message || 'Could not join this channel.';
+        $('#channelPassInput').select();
+      } else {
+        toast(msg.message || 'Could not join this channel.', true);
+        if (state.channelId === msg.channelId) leaveChannel(true);
+      }
+      pendingJoinChannelId = null;
+      pendingJoinPassword = '';
+      break;
+    case 'channel-password-set':
+      if (passModalMode === 'set' && passModalChannelId === msg.channelId) {
+        closeChannelPassword();
+        toast(msg.locked ? 'Channel password set.' : 'Channel password removed.');
+      }
+      break;
+    case 'join-error':
+      returnToJoin(msg.message || 'Unable to join.');
+      break;
+    case 'session-replaced':
+      returnToJoin(msg.message || 'This session was opened somewhere else.');
+      break;
     case 'error':
       toast(msg.message || 'Something went wrong.', true);
       break;
@@ -304,7 +401,7 @@ function route(msg) {
 /* ---------------- join ---------------- */
 function doJoin() {
   const input = $('#nameInput');
-  const name = input.value.trim().slice(0, 24) || 'Anonymous';
+  const name = input.value.trim().replace(/\s+/g, ' ').slice(0, 24) || 'Anonymous';
   $('#joinBtn').disabled = true;
   $('#joinError').textContent = '';
   if (!('RTCPeerConnection' in window)) {
@@ -314,7 +411,6 @@ function doJoin() {
   }
   unlockAudio();
   connect(name);
-  ensureMic();
 }
 $('#joinBtn').addEventListener('click', doJoin);
 $('#nameInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') doJoin(); });
@@ -350,6 +446,7 @@ function renderChannels() {
     const div = document.createElement('div');
     div.className = 'channel' + (state.channelId === ch.id ? ' active' : '');
     let html = `<div class="channel-name"><span class="ch-name">${ic('speaker', 16, 'ch-ico')}${escapeHtml(ch.name)}</span>` +
+      (ch.locked ? `<span class="ch-lock" title="Password protected">${ic('lock', 12)}</span>` : '') +
       `<span class="channel-count">${members.length}</span></div>`;
     if (members.length) {
       html += '<div class="channel-members">' + members.map((m) => {
@@ -360,9 +457,20 @@ function renderChannels() {
           `<span class="mic-state">${(m.muted || m.deafened) ? `<span class="state-muted">${ic('micOff', 12)}</span>` : ''}${m.sharing ? ic('screen', 12) : ''}</span></div>`;
       }).join('') + '</div>';
     }
-    // Build channel row with hover actions (rename / delete)
+    // Build channel row with hover actions (password / rename / delete)
     const actions = document.createElement('div');
     actions.className = 'ch-actions';
+    if (state.channelId === ch.id) {
+      const lockBtn = document.createElement('button');
+      lockBtn.className = 'icon-btn ch-act';
+      lockBtn.innerHTML = ic(ch.locked ? 'unlock' : 'lock', 13);
+      lockBtn.title = ch.locked ? 'Change or remove password' : 'Set password';
+      lockBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        openChannelPassword(ch.id, 'set');
+      });
+      actions.appendChild(lockBtn);
+    }
     const renameBtn = document.createElement('button');
     renameBtn.className = 'icon-btn ch-act';
     renameBtn.innerHTML = ic('pencil', 13);
@@ -398,15 +506,23 @@ function deleteChannel(id, name) {
 }
 
 function joinChannel(id) {
+  if (state.channelId === id) return;
   unlockAudio();
   if (!micStream && !($('#micSelect') && $('#micSelect').value === 'off')) {
     toast('Microphone not ready', true);
   }
-  if (state.channelId === id) return;
+  const ch = state.channels.find((c) => c.id === id);
+  if (ch && ch.locked) {
+    openChannelPassword(id, 'join');
+    return;
+  }
   send({ type: 'join-channel', channelId: id });
 }
 
 function leaveChannel(silent) {
+  closeChannelPassword();
+  pendingJoinChannelId = null;
+  pendingJoinPassword = '';
   stopScreen(true);
   cleanupPeers();
   stopConnPoll();
@@ -427,13 +543,75 @@ $('#addChannelBtn').addEventListener('click', () => {
 });
 $('#createChannelBtn').addEventListener('click', createChannel);
 $('#newChannelInput').addEventListener('keydown', (e) => { if (e.key === 'Enter') createChannel(); });
+$('#newChannelPass').addEventListener('keydown', (e) => { if (e.key === 'Enter') createChannel(); });
 function createChannel() {
   const v = $('#newChannelInput').value.trim().slice(0, 32);
   if (!v) return;
-  send({ type: 'create-channel', name: v });
+  const password = $('#newChannelPass').value;
+  pendingCreatedPassword = password;
+  send({ type: 'create-channel', name: v, password });
   $('#newChannelInput').value = '';
+  $('#newChannelPass').value = '';
   $('#newChannelRow').classList.add('hidden');
 }
+
+/* ---------------- channel password ---------------- */
+function openChannelPassword(channelId, mode) {
+  const ch = state.channels.find((c) => c.id === channelId);
+  if (!ch) return;
+  if (mode === 'set' && state.channelId !== channelId) {
+    toast('Join the channel first to change its password.', true);
+    return;
+  }
+  passModalChannelId = channelId;
+  passModalMode = mode;
+  $('#channelPassTitle').textContent = `#${ch.name}`;
+  $('#channelPassHint').textContent = mode === 'join'
+    ? 'This channel is locked. Enter the password to join.'
+    : 'Set a password for this channel. Leave it blank to remove the current one.';
+  $('#channelPassInput').value = '';
+  $('#channelPassError').textContent = '';
+  $('#channelPassSubmit').textContent = mode === 'join' ? 'Join' : 'Save';
+  $('#channelPassModal').classList.remove('hidden');
+  setTimeout(() => $('#channelPassInput').focus(), 0);
+}
+
+function closeChannelPassword() {
+  $('#channelPassModal').classList.add('hidden');
+  passModalChannelId = null;
+  passModalMode = 'join';
+  $('#channelPassInput').value = '';
+  $('#channelPassError').textContent = '';
+}
+
+function submitChannelPassword() {
+  if (!passModalChannelId) return;
+  const value = $('#channelPassInput').value;
+  if (passModalMode === 'join') {
+    if (!value) {
+      $('#channelPassError').textContent = 'Enter the password.';
+      return;
+    }
+    pendingJoinChannelId = passModalChannelId;
+    pendingJoinPassword = value;
+    $('#channelPassError').textContent = '';
+    send({ type: 'join-channel', channelId: passModalChannelId, password: value });
+  } else {
+    send({ type: 'set-channel-password', channelId: passModalChannelId, password: value });
+  }
+}
+
+$('#channelPassClose').addEventListener('click', closeChannelPassword);
+$('#channelPassSubmit').addEventListener('click', submitChannelPassword);
+$('#channelPassInput').addEventListener('keydown', (e) => {
+  if (e.key === 'Enter') { e.preventDefault(); submitChannelPassword(); }
+});
+$('#channelPassModal').addEventListener('click', (e) => {
+  if (e.target.id === 'channelPassModal') closeChannelPassword();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('#channelPassModal').classList.contains('hidden')) closeChannelPassword();
+});
 
 /* ---------------- mic ---------------- */
 async function ensureMic() {

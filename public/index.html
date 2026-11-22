@@ -37,6 +37,7 @@
 
     <div id="newChannelRow" class="new-channel hidden">
       <input id="newChannelInput" maxlength="32" placeholder="Channel name" autocomplete="off" />
+      <input id="newChannelPass" type="password" maxlength="128" placeholder="Password (optional)" autocomplete="new-password" />
       <button id="createChannelBtn" class="btn-primary btn-sm">Add</button>
     </div>
 
@@ -190,6 +191,25 @@
     </section>
 
     <button id="qualityApply" class="btn-primary">Apply</button>
+  </div>
+</div>
+
+<!-- ===== Channel password modal ===== -->
+<div id="channelPassModal" class="modal hidden">
+  <div class="modal-card modal-sm">
+    <div class="modal-head">
+      <h3 id="channelPassTitle">Channel password</h3>
+      <button id="channelPassClose" class="icon-btn" title="Close" aria-label="Close">
+        <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6L6 18"/></svg>
+      </button>
+    </div>
+    <p id="channelPassHint" class="field-note">This channel is locked.</p>
+    <label class="field">
+      <span>Password</span>
+      <input id="channelPassInput" type="password" maxlength="128" placeholder="Password" autocomplete="off" />
+    </label>
+    <p id="channelPassError" class="join-error"></p>
+    <button id="channelPassSubmit" class="btn-primary">Join</button>
   </div>
 </div>
 
