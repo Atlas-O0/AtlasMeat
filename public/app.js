@@ -1378,7 +1378,7 @@ $('#meMicBtn').addEventListener('click', toggleMute);
 $('#deafenBtn').addEventListener('click', toggleDeafen);
 $('#meDeafenBtn').addEventListener('click', toggleDeafen);
 $('#screenBtn').addEventListener('click', toggleScreen);
-$('#leaveBtn').addEventListener('click', leaveChannel);
+$('#leaveBtn').addEventListener('click', () => leaveChannel());
 // Hotkeys (disabled by default, user sets them in Settings)
 function isTypingTarget(el) {
   return el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable);
