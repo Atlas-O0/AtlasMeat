@@ -1643,7 +1643,6 @@ function openQuality() {
   updateHotkeysUI();
   $('#qualityModal').classList.remove('hidden');
 }
-$('#qualityBtn').addEventListener('click', openQuality);
 $('#qualityClose').addEventListener('click', () => $('#qualityModal').classList.add('hidden'));
 $('#qualityModal').addEventListener('click', (e) => {
   if (e.target.id === 'qualityModal') $('#qualityModal').classList.add('hidden');
