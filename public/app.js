@@ -1286,10 +1286,14 @@ function renderTiles() {
     const sharing = isMe ? !!screenStream : !!m.sharing;
     tile.innerHTML =
       (isMe ? '' : `<button class="vol-toggle" title="Volume">${ic('volume', 14)}</button>`) +
-      `<div class="avatar" style="background:hsl(${avatarHue(m.name)},50%,42%)">${escapeHtml(m.name.trim().charAt(0) || '?')}</div>` +
-      `<div class="t-name">${escapeHtml(m.name)}${isMe ? '<span class="t-you">you</span>' : ''}</div>` +
-      `<div class="t-flags" data-flags></div>` +
-      (sharing ? '<div class="t-share-ind">Sharing screen</div>' : '') +
+      `<div class="t-face">` +
+        `<div class="avatar" style="background:hsl(${avatarHue(m.name)},50%,42%)">${escapeHtml(m.name.trim().charAt(0) || '?')}</div>` +
+        `<div class="t-name">${escapeHtml(m.name)}${isMe ? '<span class="t-you">you</span>' : ''}</div>` +
+      `</div>` +
+      `<div class="t-meta">` +
+        `<div class="t-flags" data-flags></div>` +
+        (sharing ? '<div class="t-share-ind">Sharing screen</div>' : '') +
+      `</div>` +
       (isMe ? '' :
         `<div class="vol" data-vol><span>${ic('volume', 12)}</span>` +
         `<input type="range" min="0" max="400" step="5" value="${Math.round(vol * 100)}" />` +
