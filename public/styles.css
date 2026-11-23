@@ -348,17 +348,36 @@ svg { flex-shrink: 0; }
 .tile .t-share-ind { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
 
 .tile .vol {
-  /* Out of flow: the hidden volume row must not shift the avatar/name. */
-  position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 3;
-  display: flex; align-items: center; gap: 6px;
-  padding: 4px 6px; background: var(--side-2); border-radius: 5px;
-  box-shadow: 0 4px 14px rgba(0, 0, 0, .45);
-  opacity: 0; pointer-events: none; transition: opacity .12s;
+  /* Out of flow: the panel must not shift the avatar/name. */
+  position: absolute; left: 8px; right: 8px; bottom: 8px; z-index: 4;
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 8px; background: var(--side-2);
+  border: 1px solid var(--line-2); border-radius: 8px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, .5);
+  opacity: 0; pointer-events: none; transform: translateY(4px);
+  transition: opacity .12s, transform .12s;
 }
-.tile:hover .vol, .tile .vol.show, .tile .vol:focus-within { opacity: 1; pointer-events: auto; }
-.tile .vol input[type="range"] { flex: 1; min-width: 0; accent-color: var(--accent); cursor: pointer; }
-.tile .vol span { font-size: 10.5px; color: var(--muted); min-width: 34px; text-align: center; }
-.tile .vol span svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 2; }
+.tile:hover .vol, .tile .vol.show, .tile .vol:focus-within {
+  opacity: 1; pointer-events: auto; transform: none;
+}
+.tile .vol input[type="range"] {
+  flex: 1 1 auto; min-width: 0; width: 100%; height: 18px; margin: 0;
+  accent-color: var(--accent); cursor: pointer;
+}
+.tile .vol .vol-btn {
+  flex: 0 0 auto; width: 20px; height: 20px; padding: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: none; border: 0; border-radius: 4px; color: var(--muted);
+}
+.tile .vol .vol-btn:hover { background: var(--hover); color: var(--text); }
+.tile .vol .vol-btn svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
+.tile .vol span[data-volval] {
+  flex: 0 0 38px; font-size: 10.5px; color: var(--muted);
+  text-align: end; font-variant-numeric: tabular-nums;
+}
+.tile .vol.is-muted .vol-btn,
+.tile .vol.is-muted span[data-volval] { color: var(--danger); }
+.vol-toggle.is-muted { color: var(--danger); }
 .vol-toggle {
   position: absolute; top: 6px; inset-inline-end: 6px;
   width: 24px; height: 24px; display: flex; align-items: center; justify-content: center;

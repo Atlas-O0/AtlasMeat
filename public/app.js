@@ -99,12 +99,54 @@ const tileEls = new Map();  // memberId -> element
 const shareEls = new Map(); // 'me' | peerId -> { card, video }
 let volEditing = false;
 let tilesDirty = false;
+const volPanelsOpen = new Set(); // memberId -> volume panel is pinned open
+const lastVols = new Map();      // name -> last non-zero volume (for unmute)
 
 try { state.vols = JSON.parse(localStorage.getItem('atlasmeat:vols') || '{}'); } catch (_) { state.vols = {}; }
 function saveVols() { try { localStorage.setItem('atlasmeat:vols', JSON.stringify(state.vols)); } catch (_) {} }
 function getVolume(name) {
   const v = Number(state.vols[name]);
   return Number.isFinite(v) ? Math.min(4, Math.max(0, v)) : 1;
+}
+// Web Audio gain is only needed above 100%; create it lazily so the slider
+// boost works even when the peer was connected at a lower volume.
+function boostPeerAudio(p, isShare) {
+  const el = isShare ? p.shareAudioEl : p.audioEl;
+  if (!el) return null;
+  const ctx = ensureAudio();
+  if (!ctx) return null;
+  try {
+    const src = ctx.createMediaElementSource(el);
+    const gain = ctx.createGain();
+    src.connect(gain); gain.connect(ctx.destination);
+    if (isShare) { p.shareSrc = src; p.shareGain = gain; } else { p.audioSrc = src; p.audioGain = gain; }
+    return gain;
+  } catch (_) { return null; }
+}
+// Single place that puts the stored volume on a peer's audio. Volume 0 really
+// has to cut the sound, so it also mutes the element (see el.muted below).
+function applyPeerVolume(id) {
+  const m = state.users.find((u) => u.id === id);
+  const p = state.peers.get(id);
+  if (!m || !p) return;
+  const v = getVolume(m.name);
+  const silent = !!state.deafened || v === 0;
+  const apply = (el, gain, isShare) => {
+    if (!el) return;
+    if (!gain && v > 1 && !state.deafened) gain = boostPeerAudio(p, isShare);
+    if (gain) { el.volume = 1; gain.gain.value = state.deafened ? 0 : v; }
+    else { el.volume = Math.min(1, v); }
+    el.muted = silent;
+  };
+  apply(p.audioEl, p.audioGain, false);
+  apply(p.shareAudioEl, p.shareGain, true);
+}
+function setMemberVolume(m, value) {
+  const v = Math.min(4, Math.max(0, value));
+  if (v > 0) lastVols.set(m.name, v);
+  state.vols[m.name] = v;
+  saveVols();
+  applyPeerVolume(m.id);
 }
 function quality() {
   try {
@@ -212,6 +254,13 @@ function unlockAudio() {
 window.addEventListener('pointerup', () => {
   if (volEditing) { volEditing = false; if (tilesDirty) renderTiles(); }
 }, { passive: true });
+// Clicking anywhere outside a volume panel closes it.
+document.addEventListener('click', (e) => {
+  if (e.target.closest('.vol') || e.target.closest('.vol-toggle')) return;
+  if (!volPanelsOpen.size) return;
+  volPanelsOpen.clear();
+  document.querySelectorAll('.vol.show').forEach((el) => el.classList.remove('show'));
+});
 
 /* ---------------- websocket ---------------- */
 function wsUrl() {
@@ -991,7 +1040,7 @@ function setupRemoteAudio(p, track, isShare) {
     // uses the <audio> element directly, which avoids extra output latency.
     const boost = vol > 1;
     audio.volume = boost ? 1 : Math.min(1, vol);
-    audio.muted = !!state.deafened;
+    audio.muted = !!state.deafened || vol === 0;
     audio.srcObject = new MediaStream([track]);
     const container = document.getElementById('remoteAudios');
     if (container) container.appendChild(audio);
@@ -1298,59 +1347,51 @@ function renderTiles() {
         (sharing ? '<div class="t-share-ind">Sharing screen</div>' : '') +
       `</div>` +
       (isMe ? '' :
-        `<div class="vol" data-vol><span>${ic('volume', 12)}</span>` +
-        `<input type="range" min="0" max="400" step="5" value="${Math.round(vol * 100)}" />` +
-        `<span data-volval>${Math.round(vol * 100)}%</span></div>`);
+        `<div class="vol" data-vol>` +
+          `<button class="vol-btn" title="Mute">${ic('volume', 13)}</button>` +
+          `<input type="range" min="0" max="400" step="5" value="${Math.round(vol * 100)}" />` +
+          `<span data-volval>${Math.round(vol * 100)}%</span>` +
+        `</div>`);
     if (!isMe) {
       const toggle = tile.querySelector('.vol-toggle');
       const volBox = tile.querySelector('[data-vol]');
-      toggle.addEventListener('click', () => volBox.classList.toggle('show'));
       const slider = tile.querySelector('input[type="range"]');
       const label = tile.querySelector('[data-volval]');
-      slider.addEventListener('pointerdown', () => { volEditing = true; });
-      slider.addEventListener('input', () => {
-        const v = Number(slider.value) / 100;
-        state.vols[m.name] = v;
-        saveVols();
-        label.textContent = `${slider.value}%`;
-        const p = state.peers.get(m.id);
-        if (p && !state.deafened) {
-          // For audio elements, volume is 0..1, so scale 0-400% to 0-1 with a curve for better sensitivity
-          // Use a more sensitive curve: 0-100% = 0-1 linear, 100-400% = 1 + boost via GainNode
-          if (p.audioEl) {
-            if (p.audioGain) {
-              p.audioEl.volume = 1;
-              p.audioGain.gain.value = v;
-            } else if (v > 1) {
-              // Try to create gain boost on the fly if not exists
-              try {
-                const ctx = ensureAudio();
-                if (ctx && ctx.state === 'running') {
-                  const src = ctx.createMediaElementSource(p.audioEl);
-                  const gain = ctx.createGain();
-                  gain.gain.value = v;
-                  src.connect(gain); gain.connect(ctx.destination);
-                  p.audioSrc = src; p.audioGain = gain;
-                  p.audioEl.volume = 1;
-                }
-              } catch(_){}
-            } else {
-              p.audioEl.volume = Math.min(1, v);
-            }
-          }
-          if (p.shareAudioEl) {
-            if (p.shareGain) {
-              p.shareAudioEl.volume = 1;
-              p.shareGain.gain.value = v;
-            } else {
-              p.shareAudioEl.volume = Math.min(1, v);
-            }
-          }
-          // Fallback for Web Audio only paths
-          if (p.audioGain && !p.audioEl) p.audioGain.gain.value = v;
-          if (p.shareGain && !p.shareAudioEl) p.shareGain.gain.value = v;
-        }
+      const muteBtn = tile.querySelector('.vol-btn');
+      slider.setAttribute('aria-label', `Volume for ${m.name}`);
+      const paint = () => {
+        const v = getVolume(m.name);
+        slider.value = String(Math.round(v * 100));
+        label.textContent = `${Math.round(v * 100)}%`;
+        volBox.classList.toggle('is-muted', v === 0);
+        toggle.classList.toggle('is-muted', v === 0);
+        muteBtn.title = v === 0 ? 'Unmute' : 'Mute';
+      };
+      // Tiles are rebuilt on every state message, so the open panel is remembered
+      // by member id instead of getting closed under the user's cursor.
+      if (volPanelsOpen.has(m.id)) volBox.classList.add('show');
+      paint();
+      toggle.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const open = !volBox.classList.contains('show');
+        volBox.classList.toggle('show', open);
+        if (open) { volPanelsOpen.add(m.id); paint(); } else volPanelsOpen.delete(m.id);
       });
+      muteBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const cur = getVolume(m.name);
+        if (cur === 0) setMemberVolume(m, lastVols.get(m.name) || 1);
+        else setMemberVolume(m, 0);
+        paint();
+      });
+      slider.addEventListener('pointerdown', () => { volEditing = true; });
+      slider.addEventListener('focus', () => { volEditing = true; });
+      slider.addEventListener('blur', () => { volEditing = false; if (tilesDirty) renderTiles(); });
+      slider.addEventListener('input', () => {
+        setMemberVolume(m, Number(slider.value) / 100);
+        paint();
+      });
+      slider.addEventListener('change', () => { volEditing = false; });
     }
   });
   [...tileEls.keys()].forEach((id) => {
@@ -1588,13 +1629,7 @@ function toggleMute() {
 function toggleDeafen() {
   state.deafened = !state.deafened;
   if (micTrack) micTrack.enabled = !(state.muted || state.deafened);
-  state.peers.forEach((p) => {
-    const v = state.deafened ? 0 : getVolume(p.name);
-    if (p.audioEl) { p.audioEl.volume = p.audioGain ? 1 : Math.min(1, v); p.audioEl.muted = state.deafened; }
-    if (p.shareAudioEl) { p.shareAudioEl.volume = p.shareGain ? 1 : Math.min(1, v); p.shareAudioEl.muted = state.deafened; }
-    if (p.audioGain) p.audioGain.gain.value = v;
-    if (p.shareGain) p.shareGain.gain.value = v;
-  });
+  state.peers.forEach((p) => applyPeerVolume(p.id));
   // If deafen was just disabled, try to resume/play again (autoplay may have been blocked)
   if (!state.deafened) unlockAudio();
   pushUpdate();
