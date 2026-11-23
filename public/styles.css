@@ -288,7 +288,28 @@ svg { flex-shrink: 0; }
   color: var(--text-2); font-size: 11.5px; padding: 4px 10px; border-radius: 5px;
 }
 .share-fs:hover { background: rgba(0,0,0,.82); color: #fff; }
-.share-card:fullscreen { border-radius: 0; border: 0; }
+/* Native fullscreen. The aspect-ratio / min-height rules above must not
+   compete with the browser's :fullscreen sizing, otherwise Chrome keeps a
+   stale video layer (frozen or garbled picture) after the transition. */
+.share-card:fullscreen {
+  border-radius: 0; border: 0; background: #000;
+  width: 100vw; height: 100vh;
+  max-width: none; max-height: none;
+  aspect-ratio: auto; min-height: 0; box-shadow: none;
+}
+.share-card:fullscreen video {
+  width: 100%; height: 100%; object-fit: contain; background: #000;
+  transform: translateZ(0);
+}
+.share-card:fullscreen .share-tag { top: 14px; inset-inline-start: 14px; }
+.share-card:fullscreen .share-fs {
+  top: auto; bottom: 14px; inset-inline-end: 14px;
+  font-size: 13px; padding: 8px 16px;
+}
+.share-card:fullscreen .share-stop {
+  top: auto; bottom: 14px; inset-inline-end: auto; inset-inline-start: 14px;
+  font-size: 13px; padding: 8px 16px;
+}
 .share-card.is-fs { outline: 0; }
 
 /* participant tiles */

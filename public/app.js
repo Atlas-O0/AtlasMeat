@@ -1179,7 +1179,10 @@ function stopScreen(silent) {
   const hadAudio = !!screenAudioTrack;
   screenStream = null; screenVideoTrack = null; screenAudioTrack = null;
   const meShare = shareEls.get('me');
-  if (meShare) { meShare.card.remove(); shareEls.delete('me'); }
+  if (meShare) {
+    if (fsElement() && fsElement() === meShare.card) exitFs();
+    meShare.card.remove(); shareEls.delete('me');
+  }
   state.peers.forEach((p) => {
     // Detach the screen tracks WITHOUT renegotiating (replaceTrack(null) keeps the
     // m-lines stable, so the microphone transceiver is never disturbed).
@@ -1421,7 +1424,13 @@ function renderShares() {
     }
   });
   [...shareEls.keys()].forEach((k) => {
-    if (!seen.has(k)) { shareEls.get(k).card.remove(); shareEls.delete(k); }
+    if (!seen.has(k)) {
+      const rec = shareEls.get(k);
+      // Never yank the element the browser is fullscreening: exit first, so the
+      // page doesn't drop out of fullscreen mid-transition.
+      if (fsElement() && fsElement() === rec.card) exitFs();
+      rec.card.remove(); shareEls.delete(k);
+    }
   });
   const anyShare = sharers.length > 0;
   $('#shareBadge').classList.toggle('hidden', !anyShare);
@@ -1429,25 +1438,61 @@ function renderShares() {
   if (stage) stage.classList.toggle('has-share', anyShare);
 }
 
+function fsElement() {
+  return document.fullscreenElement || document.webkitFullscreenElement || null;
+}
+function exitFs() {
+  const fn = document.exitFullscreen || document.webkitExitFullscreen;
+  if (!fn) return;
+  try {
+    const p = fn.call(document);
+    if (p && p.catch) p.catch(() => {});
+  } catch (_) {}
+}
+function requestFs(el) {
+  const fn = el.requestFullscreen || el.webkitRequestFullscreen;
+  if (!fn) return null;
+  try {
+    return fn.call(el, { navigationUI: 'hide' });
+  } catch (_) {
+    try { return fn.call(el); } catch (_) { return null; }
+  }
+}
 function toggleShareFullscreen(card, video, btn) {
-  const isFs = document.fullscreenElement === card || document.fullscreenElement === video;
-  if (isFs) {
-    document.exitFullscreen().catch(() => {});
+  const cur = fsElement();
+  if (cur) {
+    if (cur === card || cur === video || cur.contains(card)) exitFs();
     return;
   }
-  // Prefer card fullscreen so tag/buttons stay visible
-  const target = card.requestFullscreen ? card : video;
-  const p = target.requestFullscreen ? target.requestFullscreen() : video.requestFullscreen();
-  if (p && p.catch) p.catch(() => video.requestFullscreen().catch(() => {}));
+  // Prefer card fullscreen so tag/buttons stay visible.
+  const p = requestFs(card);
+  // Some browsers reject options / only allow the video element.
+  Promise.resolve(p).catch(() => {
+    const p2 = requestFs(video);
+    if (p2 && p2.catch) p2.catch(() => {});
+  });
 }
-document.addEventListener('fullscreenchange', () => {
-  const isFs = !!document.fullscreenElement;
+function onFullscreenChange() {
+  const el = fsElement();
+  const isFs = !!el;
   document.querySelectorAll('.share-fs').forEach((b) => {
     b.textContent = isFs ? 'Exit' : 'Fullscreen';
     b.title = isFs ? 'Exit fullscreen' : 'Fullscreen';
   });
-  document.querySelectorAll('.share-card').forEach((c) => c.classList.toggle('is-fs', isFs && document.fullscreenElement === c));
-});
+  document.querySelectorAll('.share-card').forEach((c) => c.classList.toggle('is-fs', isFs && el === c));
+  // Chrome can keep showing the pre-fullscreen frame of a MediaStream video
+  // after the transition. Nudging the layer forces a fresh frame to be composited.
+  const vid = el && el.tagName === 'VIDEO' ? el : (el && el.querySelector ? el.querySelector('video') : null);
+  if (vid) {
+    vid.style.height = '100.05%';
+    requestAnimationFrame(() => {
+      vid.style.height = '';
+      if (vid.paused) vid.play().catch(() => {});
+    });
+  }
+}
+document.addEventListener('fullscreenchange', onFullscreenChange);
+document.addEventListener('webkitfullscreenchange', onFullscreenChange);
 
 function renderControls() {
   const off = (id, isOff) => $(id).classList.toggle('off', !!isOff);
