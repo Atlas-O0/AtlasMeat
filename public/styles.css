@@ -372,7 +372,7 @@ svg { flex-shrink: 0; }
 .tile .vol .vol-btn:hover { background: var(--hover); color: var(--text); }
 .tile .vol .vol-btn svg { width: 13px; height: 13px; fill: none; stroke: currentColor; stroke-width: 2; }
 .tile .vol span[data-volval] {
-  flex: 0 0 38px; font-size: 10.5px; color: var(--muted);
+  flex: 0 0 44px; font-size: 10.5px; color: var(--muted);
   text-align: end; font-variant-numeric: tabular-nums;
 }
 .tile .vol.is-muted .vol-btn,
@@ -452,6 +452,28 @@ svg { flex-shrink: 0; }
 }
 .chat-form input:focus { border-color: var(--accent); }
 .chat-form .btn-sm { padding: 0 14px; }
+.chat-img-btn {
+  flex: 0 0 auto; width: 36px; height: 36px; padding: 0; display: flex;
+  align-items: center; justify-content: center;
+  background: var(--input); color: var(--muted);
+  border: 1px solid var(--line); border-radius: 8px; cursor: pointer;
+}
+.chat-img-btn:hover:not(:disabled) { background: var(--hover); color: var(--text); border-color: var(--line-2); }
+.chat-img-btn:disabled { opacity: .45; cursor: default; }
+.chat-img-btn.busy { color: var(--accent); }
+.chat-img-btn svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+.msg .msg-img {
+  display: block; max-width: 100%; max-height: 320px; margin-top: 6px;
+  border-radius: 8px; border: 1px solid var(--line); cursor: zoom-in;
+  background: var(--input);
+}
+.messages.drop-target { outline: 2px dashed var(--accent); outline-offset: -6px; }
+.lightbox {
+  position: fixed; inset: 0; z-index: 90; padding: 24px;
+  background: rgba(0, 0, 0, .9); display: flex; align-items: center; justify-content: center;
+  cursor: zoom-out;
+}
+.lightbox img { max-width: 100%; max-height: 100%; border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,.6); }
 
 /* ---------- Modal ---------- */
 .modal {

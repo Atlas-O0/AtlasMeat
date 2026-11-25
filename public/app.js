@@ -52,7 +52,8 @@ const state = {
   speaking: new Map(), // userId -> bool
   prevMembers: [],
   peers: new Map(),    // peerId -> peer record
-  vols: {},            // peerName -> 0..2
+  vols: {},            // peerName -> gain (1 = 100%)
+  uploadToken: null,   // handed out by the server on welcome; authorizes /upload
 };
 let myId = null;
 let ws = null;
@@ -99,6 +100,8 @@ const tileEls = new Map();  // memberId -> element
 const shareEls = new Map(); // 'me' | peerId -> { card, video }
 let volEditing = false;
 let tilesDirty = false;
+const VOL_SLIDER_MAX = 200; // percent position of the volume slider
+const VOL_MAX_GAIN = 10;    // 200% position -> 10x gain (1000%)
 const volPanelsOpen = new Set(); // memberId -> volume panel is pinned open
 const lastVols = new Map();      // name -> last non-zero volume (for unmute)
 
@@ -106,7 +109,33 @@ try { state.vols = JSON.parse(localStorage.getItem('atlasmeat:vols') || '{}'); }
 function saveVols() { try { localStorage.setItem('atlasmeat:vols', JSON.stringify(state.vols)); } catch (_) {} }
 function getVolume(name) {
   const v = Number(state.vols[name]);
-  return Number.isFinite(v) ? Math.min(4, Math.max(0, v)) : 1;
+  return Number.isFinite(v) ? Math.min(VOL_MAX_GAIN, Math.max(0, v)) : 1;
+}
+// Slider is 0–200% on screen, but the boost gets steeper above 100% so maxing it
+// is actually loud: 100% = unity, 200% = 10× gain (shown as 1000%).
+function sliderToGain(pct) {
+  const p = Math.min(VOL_SLIDER_MAX, Math.max(0, Number(pct) || 0));
+  if (p <= 100) return p / 100;
+  return 1 + ((p - 100) / (VOL_SLIDER_MAX - 100)) * (VOL_MAX_GAIN - 1);
+}
+function gainToSlider(gain) {
+  const g = Math.min(VOL_MAX_GAIN, Math.max(0, Number(gain) || 0));
+  if (g <= 1) return g * 100;
+  return 100 + ((g - 1) / (VOL_MAX_GAIN - 1)) * (VOL_SLIDER_MAX - 100);
+}
+// gain -> limiter -> speakers. Without the limiter a big boost clips and just
+// sounds harsh instead of louder.
+function buildBoostGraph(el, ctx) {
+  const src = ctx.createMediaElementSource(el);
+  const gain = ctx.createGain();
+  const limiter = ctx.createDynamicsCompressor();
+  limiter.threshold.value = -12;
+  limiter.knee.value = 6;
+  limiter.ratio.value = 12;
+  limiter.attack.value = 0.003;
+  limiter.release.value = 0.25;
+  src.connect(gain); gain.connect(limiter); limiter.connect(ctx.destination);
+  return { src, gain };
 }
 // Web Audio gain is only needed above 100%; create it lazily so the slider
 // boost works even when the peer was connected at a lower volume.
@@ -116,9 +145,7 @@ function boostPeerAudio(p, isShare) {
   const ctx = ensureAudio();
   if (!ctx) return null;
   try {
-    const src = ctx.createMediaElementSource(el);
-    const gain = ctx.createGain();
-    src.connect(gain); gain.connect(ctx.destination);
+    const { src, gain } = buildBoostGraph(el, ctx);
     if (isShare) { p.shareSrc = src; p.shareGain = gain; } else { p.audioSrc = src; p.audioGain = gain; }
     return gain;
   } catch (_) { return null; }
@@ -142,7 +169,7 @@ function applyPeerVolume(id) {
   apply(p.shareAudioEl, p.shareGain, true);
 }
 function setMemberVolume(m, value) {
-  const v = Math.min(4, Math.max(0, value));
+  const v = Math.min(VOL_MAX_GAIN, Math.max(0, value));
   if (v > 0) lastVols.set(m.name, v);
   state.vols[m.name] = v;
   saveVols();
@@ -335,6 +362,7 @@ function route(msg) {
     case 'welcome':
       myId = msg.id;
       state.joined = true;
+      if (msg.uploadToken) state.uploadToken = msg.uploadToken;
       if (msg.name) state.myName = msg.name;
       state.users = msg.users || [];
       state.channels = msg.channels || [];
@@ -390,8 +418,12 @@ function route(msg) {
       onSignal(msg.from, msg.data);
       break;
     case 'speaking':
-      state.speaking.set(msg.userId, !!msg.speaking);
-      updatePresence();
+      // Our own meter on the received audio is more accurate; the sender's flag
+      // is only a fallback until that track is available.
+      if (!remoteVad.has(msg.userId)) {
+        state.speaking.set(msg.userId, !!msg.speaking);
+        updatePresence();
+      }
       break;
     case 'chat':
       if (msg.channelId === state.channelId) {
@@ -777,8 +809,10 @@ function startVAD() {
       sum += v * v;
     }
     const rms = Math.sqrt(sum / micAnalyserData.length);
-    smooth = smooth * 0.7 + rms * 0.3;
-    const speaking = localSpeaking ? smooth > 0.018 : smooth > 0.035;
+    // Fast attack / slow release: a linear smoothing kept the ring behind the
+    // first word and lit it up late on quiet mics.
+    smooth = rms > smooth ? rms : smooth * 0.72 + rms * 0.28;
+    const speaking = localSpeaking ? smooth > 0.014 : smooth > 0.028;
     if (speaking !== localSpeaking) setLocalSpeaking(speaking);
     if (speaking !== lastSent && state.channelId) {
       lastSent = speaking;
@@ -794,6 +828,63 @@ function stopVAD() {
 function setLocalSpeaking(v) {
   localSpeaking = v;
   updatePresence();
+}
+
+/* ---------------- remote speaking detection ---------------- */
+// The sender's own voice detection is only advisory: quiet mics, a muted track
+// or AGC make it miss the first word and hang on background noise. So the ring
+// is driven by the audio we actually receive, measured locally per peer.
+const remoteVad = new Map(); // peerId -> meter record
+
+function stopRemoteVad(peerId) {
+  const r = remoteVad.get(peerId);
+  remoteVad.delete(peerId);
+  if (r) {
+    clearInterval(r.timer);
+    try { r.src.disconnect(); } catch (_) {}
+  }
+  if (state.speaking.get(peerId)) {
+    state.speaking.set(peerId, false);
+    updatePresence();
+  }
+}
+
+function startRemoteVad(peerId, track) {
+  stopRemoteVad(peerId);
+  if (!peerId || !track) return;
+  const ctx = ensureAudio();
+  if (!ctx) return;
+  try {
+    if (ctx.state === 'suspended') ctx.resume().catch(() => {});
+    const stream = new MediaStream([track]);
+    const src = ctx.createMediaStreamSource(stream);
+    const analyser = ctx.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.4;
+    src.connect(analyser);
+    const rec = { src, stream, analyser, data: new Uint8Array(analyser.fftSize), smooth: 0, talking: false, timer: null };
+    rec.timer = setInterval(() => {
+      try {
+        rec.analyser.getByteTimeDomainData(rec.data);
+      } catch (_) { stopRemoteVad(peerId); return; }
+      let sum = 0;
+      for (let i = 0; i < rec.data.length; i++) {
+        const v = (rec.data[i] - 128) / 128;
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / rec.data.length);
+      // Fast attack so the ring appears with the first syllable, slow decay with
+      // hysteresis so it does not flicker between words.
+      rec.smooth = rms > rec.smooth ? rms : rec.smooth * 0.72 + rms * 0.28;
+      const on = rec.talking ? rec.smooth > 0.010 : rec.smooth > 0.020;
+      if (on !== rec.talking) {
+        rec.talking = on;
+        state.speaking.set(peerId, on);
+        updatePresence();
+      }
+    }, 70);
+    remoteVad.set(peerId, rec);
+  } catch (_) {}
 }
 
 /* ---------------- webrtc mesh ---------------- */
@@ -992,6 +1083,7 @@ function onRemoteTrack(p, e) {
       track.onended = () => { if (p.remoteAudioTrack === track) { teardownRemoteAudio(p, false); renderTiles(); } };
       track.onunmute = () => { if (p.remoteAudioTrack === track && !p.audioEl) setupRemoteAudio(p, track, false); };
       setupRemoteAudio(p, track, false);
+      startRemoteVad(p.id, track);
     } else {
       if (p.remoteShareAudioTrack) teardownRemoteAudio(p, true);
       p.remoteShareAudioTrack = track;
@@ -1013,6 +1105,7 @@ function releaseRemoteAudio(p, isShare) {
       try { if (p.shareGain) p.shareGain.disconnect(); } catch (_) {}
       p.shareAudioEl = null; p.shareSrc = null; p.shareGain = null;
     } else {
+      stopRemoteVad(p.id);
       if (p.audioEl) { try { p.audioEl.pause(); p.audioEl.srcObject = null; p.audioEl.remove(); } catch (_) {} }
       if (p.audioSrc) { try { p.audioSrc.disconnect(); } catch (_) {} }
       try { if (p.audioGain) p.audioGain.disconnect(); } catch (_) {}
@@ -1028,7 +1121,7 @@ function teardownRemoteAudio(p, isShare) {
 
 function setupRemoteAudio(p, track, isShare) {
   // Always use <audio> element — reliable across autoplay policies.
-  // Create a persistent gain for >100% boost so slider 0-400% actually matters.
+  // Create a persistent gain for >100% boost so the slider boost actually works.
   try {
     releaseRemoteAudio(p, isShare);
     const audio = document.createElement('audio');
@@ -1058,17 +1151,14 @@ function setupRemoteAudio(p, track, isShare) {
     if (isShare) p.shareAudioEl = audio;
     else p.audioEl = audio;
 
-    // Web Audio gain is only needed for the 100–400% boost range.
+    // Web Audio gain is only needed above 100%.
     if (boost) {
       const ctx = ensureAudio();
       if (ctx) {
         try {
           if (ctx.state === 'suspended') ctx.resume().catch(()=>{});
-          const src = ctx.createMediaElementSource(audio);
-          const gain = ctx.createGain();
+          const { src, gain } = buildBoostGraph(audio, ctx);
           gain.gain.value = vol;
-          src.connect(gain);
-          gain.connect(ctx.destination);
           audio.volume = 1;
           if (isShare) { p.shareSrc = src; p.shareGain = gain; }
           else { p.audioSrc = src; p.audioGain = gain; }
@@ -1119,6 +1209,7 @@ function closePeer(peerId) {
   try { p.pc.close(); } catch (_) {}
   teardownRemoteAudio(p, false);
   teardownRemoteAudio(p, true);
+  stopRemoteVad(peerId);
   state.peers.delete(peerId);
   state.speaking.delete(peerId);
   const t = tileEls.get(peerId);
@@ -1314,6 +1405,8 @@ function renderHeader() {
   const ci = $('#chatInput');
   ci.disabled = !inChannel;
   $('#chatSend').disabled = !inChannel;
+  const imgBtn = $('#chatImage');
+  if (imgBtn) imgBtn.disabled = !inChannel || uploading;
   ci.placeholder = inChannel ? `Message #${ch.name}` : 'Select a channel';
 }
 
@@ -1349,7 +1442,7 @@ function renderTiles() {
       (isMe ? '' :
         `<div class="vol" data-vol>` +
           `<button class="vol-btn" title="Mute">${ic('volume', 13)}</button>` +
-          `<input type="range" min="0" max="400" step="5" value="${Math.round(vol * 100)}" />` +
+          `<input type="range" min="0" max="${VOL_SLIDER_MAX}" step="5" value="${Math.round(gainToSlider(vol))}" />` +
           `<span data-volval>${Math.round(vol * 100)}%</span>` +
         `</div>`);
     if (!isMe) {
@@ -1359,9 +1452,10 @@ function renderTiles() {
       const label = tile.querySelector('[data-volval]');
       const muteBtn = tile.querySelector('.vol-btn');
       slider.setAttribute('aria-label', `Volume for ${m.name}`);
+      slider.title = `Volume 0–${VOL_SLIDER_MAX}% (up to ${VOL_MAX_GAIN * 100}%)`;
       const paint = () => {
         const v = getVolume(m.name);
-        slider.value = String(Math.round(v * 100));
+        slider.value = String(Math.round(gainToSlider(v)));
         label.textContent = `${Math.round(v * 100)}%`;
         volBox.classList.toggle('is-muted', v === 0);
         toggle.classList.toggle('is-muted', v === 0);
@@ -1388,7 +1482,7 @@ function renderTiles() {
       slider.addEventListener('focus', () => { volEditing = true; });
       slider.addEventListener('blur', () => { volEditing = false; if (tilesDirty) renderTiles(); });
       slider.addEventListener('input', () => {
-        setMemberVolume(m, Number(slider.value) / 100);
+        setMemberVolume(m, sliderToGain(Number(slider.value)));
         paint();
       });
       slider.addEventListener('change', () => { volEditing = false; });
@@ -1586,7 +1680,9 @@ function msgEl(m) {
   time.className = 'msg-time';
   time.textContent = timeStr(m.ts);
   head.appendChild(name); head.appendChild(time);
-  div.appendChild(head); div.appendChild(text);
+  div.appendChild(head);
+  if (m.image) div.appendChild(imageEl(m.image));
+  if (m.text) div.appendChild(text);
   return div;
 }
 function appendMsg(m) {
@@ -1610,6 +1706,149 @@ function sendChatFromInput() {
   send({ type: 'chat', text: text.slice(0, 1000) });
   input.value = '';
 }
+
+/* ---------------- chat images ---------------- */
+const IMG_UPLOAD_MAX = 6 * 1024 * 1024; // keep in sync with the server limit
+let uploading = false;
+
+function imageEl(src) {
+  const img = document.createElement('img');
+  img.className = 'msg-img';
+  img.src = src;
+  img.alt = 'Shared image';
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.addEventListener('click', () => openLightbox(src));
+  return img;
+}
+let lightboxEl = null;
+function closeLightbox() {
+  if (!lightboxEl) return;
+  lightboxEl.remove();
+  lightboxEl = null;
+  document.removeEventListener('keydown', lightboxKey);
+}
+function lightboxKey(e) { if (e.key === 'Escape') closeLightbox(); }
+function openLightbox(src) {
+  closeLightbox();
+  const box = document.createElement('div');
+  box.className = 'lightbox';
+  const img = document.createElement('img');
+  img.src = src;
+  img.alt = 'Shared image';
+  box.appendChild(img);
+  box.addEventListener('click', closeLightbox);
+  document.body.appendChild(box);
+  document.addEventListener('keydown', lightboxKey);
+  lightboxEl = box;
+}
+
+// Shrink to 1600px and re-encode as WebP so a phone photo is a few hundred KB
+// instead of several MB. GIFs and anything the browser cannot decode are sent
+// as-is.
+async function prepareImage(file) {
+  if (file.type === 'image/gif') return file;
+  let bitmap = null;
+  try { bitmap = await createImageBitmap(file); } catch (_) { return file; }
+  try {
+    const max = 1600;
+    const scale = Math.min(1, max / Math.max(bitmap.width, bitmap.height));
+    const w = Math.max(1, Math.round(bitmap.width * scale));
+    const h = Math.max(1, Math.round(bitmap.height * scale));
+    const canvas = document.createElement('canvas');
+    canvas.width = w; canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return file;
+    ctx.drawImage(bitmap, 0, 0, w, h);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, 'image/webp', 0.82));
+    if (!blob) return file;
+    return blob.size < file.size ? blob : file;
+  } catch (_) {
+    return file;
+  } finally {
+    try { if (bitmap && bitmap.close) bitmap.close(); } catch (_) {}
+  }
+}
+
+function setUploading(on) {
+  uploading = on;
+  const btn = $('#chatImage');
+  if (btn) { btn.disabled = on || !state.channelId; btn.classList.toggle('busy', on); }
+}
+
+async function sendImage(file) {
+  if (!file || !state.channelId) return;
+  if (!/^image\//.test(file.type || '')) { toast('Only images can be shared.', true); return; }
+  if (!state.uploadToken) { toast('Still connecting — try again in a second.', true); return; }
+  setUploading(true);
+  try {
+    const blob = await prepareImage(file);
+    if (!blob || blob.size > IMG_UPLOAD_MAX) { toast('Image is too large (max 6 MB).', true); return; }
+    const res = await fetch('/upload', {
+      method: 'POST',
+      headers: {
+        'Content-Type': blob.type || file.type || 'application/octet-stream',
+        'X-Upload-Token': state.uploadToken,
+      },
+      body: blob,
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok || !data.url) { toast(data.error || `Upload failed (${res.status}).`, true); return; }
+    send({ type: 'chat', text: '', image: data.url });
+  } catch (e) {
+    toast('Could not send that image.', true);
+  } finally {
+    setUploading(false);
+  }
+}
+
+function firstImageFile(list) {
+  if (!list) return null;
+  for (const f of list) { if (f && /^image\//.test(f.type || '')) return f; }
+  return null;
+}
+
+const filePicker = document.createElement('input');
+filePicker.type = 'file';
+filePicker.accept = 'image/png,image/jpeg,image/webp,image/gif';
+filePicker.hidden = true;
+filePicker.addEventListener('change', () => {
+  const f = filePicker.files && filePicker.files[0];
+  filePicker.value = '';
+  if (f) sendImage(f);
+});
+document.body.appendChild(filePicker);
+$('#chatImage').addEventListener('click', () => { if (!uploading) filePicker.click(); });
+
+// Paste an image straight into the composer (Ctrl+V).
+$('#chatInput').addEventListener('paste', (e) => {
+  const f = firstImageFile(e.clipboardData && e.clipboardData.files);
+  if (!f) return;
+  e.preventDefault();
+  sendImage(f);
+});
+
+// Drag a file onto the chat list.
+(() => {
+  const box = $('#messages');
+  let depth = 0;
+  const clear = () => { depth = 0; box.classList.remove('drop-target'); };
+  box.addEventListener('dragenter', (e) => {
+    if (!state.channelId || !Array.from(e.dataTransfer?.types || []).includes('Files')) return;
+    e.preventDefault(); depth += 1; box.classList.add('drop-target');
+  });
+  box.addEventListener('dragover', (e) => {
+    if (!state.channelId) return;
+    e.preventDefault();
+    if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
+  });
+  box.addEventListener('dragleave', () => { depth -= 1; if (depth <= 0) clear(); });
+  box.addEventListener('drop', (e) => {
+    e.preventDefault(); clear();
+    const f = firstImageFile(e.dataTransfer && e.dataTransfer.files);
+    if (f) sendImage(f);
+  });
+})();
 $('#chatForm').addEventListener('submit', (e) => {
   e.preventDefault();
   sendChatFromInput();

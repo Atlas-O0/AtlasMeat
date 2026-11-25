@@ -4,15 +4,77 @@
 const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
+const fs = require('fs');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 
 const PORT = process.env.PORT || 3000;
 
+// Persistent data lives outside the deploy directory on a VPS so a redeploy or
+// restart never loses channels, passwords or chat history.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
+const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
+const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'atlasmeat.db');
+try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (_) {}
+
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
 app.get('/health', (req, res) => res.json({ ok: true }));
 app.get('/favicon.ico', (req, res) => res.status(204).end());
+
+// ---- Chat images ----
+// Uploaded files are named by us and served with nosniff; only raster formats
+// are accepted (no SVG, so an upload can never run script on our origin).
+const UPLOAD_MAX = 6 * 1024 * 1024;
+const UPLOAD_NAME_RE = /^\/uploads\/[a-f0-9]{18}\.(png|jpg|webp|gif)$/;
+
+app.use('/uploads', express.static(UPLOAD_DIR, {
+  immutable: true,
+  maxAge: '30d',
+  index: false,
+  dotfiles: 'deny',
+  setHeaders: (res) => {
+    res.setHeader('X-Content-Type-Options', 'nosniff');
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'unsafe-inline'; sandbox");
+  },
+}));
+
+function sniffImage(buf) {
+  if (buf.length > 8 && buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47 &&
+      buf[4] === 0x0d && buf[5] === 0x0a && buf[6] === 0x1a && buf[7] === 0x0a) return 'png';
+  if (buf.length > 3 && buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) return 'jpg';
+  if (buf.length > 12 && buf.toString('ascii', 0, 4) === 'RIFF' && buf.toString('ascii', 8, 12) === 'WEBP') return 'webp';
+  if (buf.length > 6) {
+    const head = buf.toString('ascii', 0, 6);
+    if (head === 'GIF87a' || head === 'GIF89a') return 'gif';
+  }
+  return null;
+}
+
+app.post('/upload', express.raw({ type: '*/*', limit: UPLOAD_MAX }), (req, res) => {
+  res.set('Cache-Control', 'no-store');
+  const token = String(req.get('x-upload-token') || '');
+  const user = token ? [...users.values()].find((u) => u.uploadToken && u.uploadToken === token) : null;
+  if (!user) return res.status(401).json({ error: 'Not signed in. Reconnect and try again.' });
+
+  const now = Date.now();
+  if (!user.uploadWindow || now > user.uploadWindow.reset) user.uploadWindow = { count: 0, reset: now + 60000 };
+  user.uploadWindow.count += 1;
+  if (user.uploadWindow.count > 12) return res.status(429).json({ error: 'Too many images. Wait a minute.' });
+
+  const buf = Buffer.isBuffer(req.body) ? req.body : null;
+  if (!buf || buf.length < 32) return res.status(400).json({ error: 'Empty upload.' });
+  const ext = sniffImage(buf);
+  if (!ext) return res.status(415).json({ error: 'Only PNG, JPEG, WebP or GIF images.' });
+  const name = crypto.randomBytes(9).toString('hex') + '.' + ext;
+  try {
+    fs.writeFileSync(path.join(UPLOAD_DIR, name), buf);
+  } catch (e) {
+    console.error('upload write failed:', e.message);
+    return res.status(500).json({ error: 'Could not store the image.' });
+  }
+  res.json({ url: '/uploads/' + name });
+});
 
 // ---- TURN credentials (Cloudflare Realtime TURN, free tier) ----
 // Set CF_TURN_KEY_ID and CF_TURN_API_TOKEN in the environment (Render → Environment).
@@ -158,14 +220,137 @@ function verifyPassword(password, stored) {
   }
 }
 
-// Seed channels
-[
-  ['c_lounge', 'Lounge'],
-  ['c_gaming', 'Gaming'],
-  ['c_study', 'Study'],
-].forEach(([id, name]) => channels.set(id, { id, name, messages: [] }));
-
 const MAX_CHAT = 200;
+
+// ---- Persistence (SQLite through node:sqlite) ----
+// Channels, their password hashes and chat history survive restarts; users stay
+// in memory because they are tied to an open socket.
+let db = null;
+try {
+  const { DatabaseSync } = require('node:sqlite');
+  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
+  db = new DatabaseSync(DB_PATH);
+  db.exec(`
+    PRAGMA journal_mode = WAL;
+    CREATE TABLE IF NOT EXISTS channels (
+      id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      password_hash TEXT,
+      position INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS messages (
+      id TEXT PRIMARY KEY,
+      channel_id TEXT NOT NULL,
+      user_id TEXT,
+      name TEXT,
+      text TEXT,
+      image TEXT,
+      ts INTEGER NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS messages_channel_ts ON messages (channel_id, ts);
+  `);
+  console.log('state store:', DB_PATH);
+} catch (e) {
+  console.warn('state persistence disabled:', e.message);
+}
+
+function dbRun(sql, params) {
+  if (!db) return;
+  try { db.prepare(sql).run(...params); }
+  catch (e) { console.warn('db write failed:', e.message); }
+}
+function saveChannelRow(ch) {
+  dbRun(
+    `INSERT INTO channels (id, name, password_hash, position, created_at) VALUES (?, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET name = excluded.name, password_hash = excluded.password_hash`,
+    [ch.id, ch.name, ch.passwordHash || null, ch.position || 0, ch.createdAt || Date.now()]
+  );
+}
+function deleteChannelRows(id) {
+  dbRun('DELETE FROM messages WHERE channel_id = ?', [id]);
+  dbRun('DELETE FROM channels WHERE id = ?', [id]);
+}
+function saveMessageRow(channelId, m) {
+  dbRun(
+    'INSERT OR REPLACE INTO messages (id, channel_id, user_id, name, text, image, ts) VALUES (?, ?, ?, ?, ?, ?, ?)',
+    [m.id, channelId, m.userId || null, m.name || '', m.text || '', m.image || null, m.ts]
+  );
+  dbRun(
+    `DELETE FROM messages WHERE channel_id = ? AND id NOT IN (
+       SELECT id FROM messages WHERE channel_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?
+     )`,
+    [channelId, channelId, MAX_CHAT]
+  );
+}
+function channelHistory(channelId) {
+  if (!db) return [];
+  try {
+    const rows = db.prepare(
+      'SELECT id, user_id, name, text, image, ts FROM messages WHERE channel_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?'
+    ).all(channelId, MAX_CHAT);
+    return rows.reverse().map((r) => {
+      const m = { id: r.id, userId: r.user_id || '', name: r.name || '', text: r.text || '', ts: r.ts };
+      if (r.image) m.image = r.image;
+      return m;
+    });
+  } catch (e) { console.warn('db read failed:', e.message); return []; }
+}
+// Images whose message fell out of the history (or whose channel was deleted)
+// are invisible but still on disk, so sweep them once in a while. Files newer
+// than a day are kept: an upload that is still in flight has no message yet.
+const UPLOAD_GRACE_MS = 24 * 60 * 60 * 1000;
+function cleanupOrphanUploads() {
+  if (!db) return;
+  try {
+    const used = new Set();
+    db.prepare('SELECT image FROM messages WHERE image IS NOT NULL').all()
+      .forEach((r) => { if (r.image) used.add(path.basename(r.image)); });
+    const now = Date.now();
+    let removed = 0;
+    for (const name of fs.readdirSync(UPLOAD_DIR)) {
+      if (!/^[a-f0-9]{18}\.(png|jpg|webp|gif)$/.test(name) || used.has(name)) continue;
+      const full = path.join(UPLOAD_DIR, name);
+      try {
+        if (now - fs.statSync(full).mtimeMs < UPLOAD_GRACE_MS) continue;
+        fs.unlinkSync(full);
+        removed += 1;
+      } catch (_) { /* already gone */ }
+    }
+    if (removed) console.log('uploads cleanup: removed', removed, 'orphan file(s)');
+  } catch (e) {
+    console.warn('uploads cleanup failed:', e.message);
+  }
+}
+
+function loadChannels() {
+  channels.clear();
+  let rows = [];
+  if (db) {
+    try {
+      rows = db.prepare('SELECT id, name, password_hash, position, created_at FROM channels ORDER BY position, created_at').all();
+    } catch (e) { console.warn('db read failed:', e.message); }
+  }
+  if (!rows.length) {
+    [['c_lounge', 'Lounge'], ['c_gaming', 'Gaming'], ['c_study', 'Study']].forEach(([id, name], i) => {
+      const ch = { id, name, messages: [], passwordHash: null, position: i, createdAt: Date.now() };
+      channels.set(id, ch);
+      saveChannelRow(ch);
+    });
+    return;
+  }
+  rows.forEach((r) => {
+    channels.set(r.id, {
+      id: r.id,
+      name: r.name,
+      messages: channelHistory(r.id),
+      passwordHash: r.password_hash || null,
+      position: r.position || 0,
+      createdAt: r.created_at || Date.now(),
+    });
+  });
+}
+loadChannels();
 
 // ---- Helpers ----
 function send(ws, msg) {
@@ -267,6 +452,8 @@ wss.on('connection', (ws) => {
     muted: false,
     deafened: false,
     sharing: false,
+    uploadToken: crypto.randomBytes(18).toString('hex'),
+    uploadWindow: null,
   };
   users.set(user.id, user);
 
@@ -314,6 +501,7 @@ wss.on('connection', (ws) => {
           name: user.name,
           users: publicUsers(),
           channels: publicChannels(),
+          uploadToken: user.uploadToken,
         });
         broadcastState();
         break;
@@ -323,12 +511,16 @@ wss.on('connection', (ws) => {
         if (!name) break;
         const rawPassword = String(msg.password || '').slice(0, 128);
         const id = newChannelId();
-        channels.set(id, {
+        const ch = {
           id,
           name,
           messages: [],
           passwordHash: rawPassword.trim() ? hashPassword(rawPassword) : null,
-        });
+          position: channels.size,
+          createdAt: Date.now(),
+        };
+        channels.set(id, ch);
+        saveChannelRow(ch);
         broadcastState();
         joinChannel(user, id, rawPassword);
         break;
@@ -343,6 +535,7 @@ wss.on('connection', (ws) => {
         }
         const rawPassword = String(msg.password || '').slice(0, 128);
         ch.passwordHash = rawPassword.trim() ? hashPassword(rawPassword) : null;
+        saveChannelRow(ch);
         broadcastState();
         send(ws, { type: 'channel-password-set', channelId: id, locked: !!ch.passwordHash });
         break;
@@ -354,9 +547,11 @@ wss.on('connection', (ws) => {
         const ch = channels.get(id);
         if (!ch) { send(ws, { type: 'error', message: 'Channel not found.' }); break; }
         ch.name = name;
+        saveChannelRow(ch);
         broadcastState();
         // also push a system chat so everyone sees the rename
         ch.messages.push({ id: 'm' + Date.now().toString(36), userId: user.id, name: 'System', text: `Channel renamed to "${name}" by ${user.name}`, ts: Date.now() });
+        saveMessageRow(id, ch.messages[ch.messages.length - 1]);
         broadcastChannel(id, { type: 'chat', channelId: id, message: ch.messages[ch.messages.length - 1] });
         break;
       }
@@ -376,6 +571,7 @@ wss.on('connection', (ws) => {
           broadcastChannel(id, { type: 'peer-left', peerId: u.id }, u.id);
         }
         channels.delete(id);
+        deleteChannelRows(id);
         broadcastState();
         break;
       }
@@ -417,7 +613,9 @@ wss.on('connection', (ws) => {
       }
       case 'chat': {
         const text = String(msg.text || '').trim().slice(0, 1000);
-        if (!text || !user.channelId) break;
+        // Images are accepted only as paths we handed out ourselves.
+        const image = typeof msg.image === 'string' && UPLOAD_NAME_RE.test(msg.image) ? msg.image : null;
+        if ((!text && !image) || !user.channelId) break;
         const ch = channels.get(user.channelId);
         if (!ch) break;
         const message = {
@@ -427,8 +625,10 @@ wss.on('connection', (ws) => {
           text,
           ts: Date.now(),
         };
+        if (image) message.image = image;
         ch.messages.push(message);
         if (ch.messages.length > MAX_CHAT) ch.messages.splice(0, ch.messages.length - MAX_CHAT);
+        saveMessageRow(user.channelId, message);
         broadcastChannel(user.channelId, { type: 'chat', channelId: user.channelId, message });
         break;
       }
@@ -458,3 +658,6 @@ wss.on('connection', (ws) => {
 server.listen(PORT, () => {
   console.log(`AtlasMeat running at http://localhost:${PORT}`);
 });
+
+setTimeout(cleanupOrphanUploads, 60 * 1000);
+setInterval(cleanupOrphanUploads, 12 * 60 * 60 * 1000).unref();
