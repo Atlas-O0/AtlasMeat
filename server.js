@@ -8,6 +8,11 @@ const fs = require('fs');
 const express = require('express');
 const { WebSocketServer } = require('ws');
 
+// SFU mode: set SFU=1 to relay media through the server (one uplink per client)
+// instead of the peer-to-peer mesh. Falls back to mesh when the module is missing.
+const SFU_REQUESTED = process.env.SFU === '1';
+let sfu = null;
+
 const PORT = process.env.PORT || 3000;
 
 // Persistent data lives outside the deploy directory on a VPS so a redeploy or
@@ -16,6 +21,17 @@ const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const UPLOAD_DIR = process.env.UPLOAD_DIR || path.join(DATA_DIR, 'uploads');
 const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'atlasmeat.db');
 try { fs.mkdirSync(UPLOAD_DIR, { recursive: true }); } catch (_) {}
+
+if (SFU_REQUESTED) {
+  try {
+    const { Sfu } = require('./sfu-server');
+    sfu = new Sfu({ send: (user, msg) => send(user.ws, msg), log: (m) => console.log(m) });
+    console.log('SFU mode: enabled');
+  } catch (e) {
+    console.warn('SFU requested but unavailable, using mesh:', e.message);
+  }
+}
+const SFU_ON = !!sfu;
 
 const app = express();
 app.use(express.static(path.join(__dirname, 'public')));
@@ -451,6 +467,7 @@ function joinChannel(user, channelId, password) {
     peer: { id: user.id, name: user.name },
   }, user.id);
   broadcastState();
+  if (sfu) sfu.syncChannel(user);
 }
 
 // ---- Connection handling ----
@@ -516,6 +533,7 @@ wss.on('connection', (ws) => {
           users: publicUsers(),
           channels: publicChannels(),
           uploadToken: user.uploadToken,
+          sfu: SFU_ON,
         });
         broadcastState();
         break;
@@ -687,11 +705,13 @@ wss.on('connection', (ws) => {
         break;
       }
       default:
+        if (sfu && msg.type.startsWith('sfu-')) sfu.handle(user, msg);
         break;
     }
   });
 
   ws.on('close', () => {
+    if (sfu) sfu.drop(user);
     if (user.replaced) {
       users.delete(user.id);
       return;

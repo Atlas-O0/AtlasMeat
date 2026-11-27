@@ -54,6 +54,7 @@ const state = {
   peers: new Map(),    // peerId -> peer record
   vols: {},            // peerName -> gain (1 = 100%)
   uploadToken: null,   // handed out by the server on welcome; authorizes /upload
+  sfu: false,          // server relays media (one uplink) instead of mesh
 };
 let myId = null;
 let ws = null;
@@ -94,6 +95,13 @@ let localSpeaking = false;
 let screenStream = null;
 let screenVideoTrack = null;
 let screenAudioTrack = null;
+
+/* SFU mode: one connection to the server instead of a mesh of peers */
+let sfuPc = null;
+let sfuBusy = false;
+const sfuPublishers = new Map(); // mid -> { publisherId, name, kind }
+const sfuTracks = new Map();     // mid -> { track, receiver } waiting for its owner
+const sfuPublished = new Map();  // 'mic' | 'screen' -> RTCRtpSender
 
 /* ui caches */
 const tileEls = new Map();  // memberId -> element
@@ -364,6 +372,7 @@ function route(msg) {
       myId = msg.id;
       state.joined = true;
       if (msg.uploadToken) state.uploadToken = msg.uploadToken;
+      state.sfu = !!msg.sfu;
       if (msg.name) state.myName = msg.name;
       state.users = msg.users || [];
       state.channels = msg.channels || [];
@@ -400,6 +409,7 @@ function route(msg) {
       state.speaking.clear();
       setMessages(msg.history || []);
       (msg.peers || []).forEach((p) => getPeer(p.id, p.name));
+      if (state.sfu) { sfuStart(); sfuSyncTracks(); }
       renderAll();
       startConnPoll();
       break;
@@ -468,6 +478,38 @@ function route(msg) {
     case 'chat-action-error':
       toast(msg.message || 'Could not update that message.', true);
       break;
+    case 'sfu-offer': {
+      if (!state.sfu) break;
+      if (!sfuPc) sfuStart();
+      (async () => {
+        // The server renegotiates when someone new publishes. Wait for our own
+        // offer to settle: rolling it back would drop the mic m-line we just added.
+        for (let i = 0; i < 60 && sfuPc.signalingState !== 'stable'; i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        if (sfuPc.signalingState !== 'stable') { try { await sfuPc.setLocalDescription({ type: 'rollback' }); } catch (_) {} }
+        await sfuPc.setRemoteDescription({ type: 'offer', sdp: msg.sdp });
+        const answer = await sfuPc.createAnswer();
+        await sfuPc.setLocalDescription(answer);
+        send({ type: 'sfu-answer', sdp: sfuPc.localDescription.sdp });
+      })().catch(() => {});
+      break;
+    }
+    case 'sfu-answer':
+      if (sfuPc && msg.sdp && sfuPc.signalingState === 'have-local-offer') {
+        sfuPc.setRemoteDescription({ type: 'answer', sdp: msg.sdp }).catch(() => {});
+      }
+      break;
+    case 'sfu-candidate':
+      if (sfuPc && msg.candidate) sfuPc.addIceCandidate(msg.candidate).catch(() => {});
+      break;
+    case 'sfu-track': {
+      const mid = String(msg.mid);
+      sfuPublishers.set(mid, { publisherId: msg.publisherId, name: msg.name, kind: msg.kind });
+      const waiting = sfuTracks.get(mid);
+      if (waiting) { sfuTracks.delete(mid); sfuAttachTrack(mid, waiting.track, waiting.receiver); }
+      break;
+    }
     case 'channel-deleted': {
       channelPasswords.delete(msg.channelId);
       if (passModalChannelId === msg.channelId) closeChannelPassword();
@@ -636,6 +678,7 @@ function leaveChannel(silent) {
   pendingJoinPassword = '';
   stopScreen(true);
   cleanupPeers();
+  sfuStop();
   stopConnPoll();
   if (!silent) send({ type: 'leave-channel' });
   state.channelId = null;
@@ -748,6 +791,7 @@ async function ensureMic() {
   micTrack = micStream.getAudioTracks()[0];
   micTrack.enabled = !(state.muted || state.deafened);
   startVAD();
+  if (state.sfu) { sfuSyncTracks(); return; }
   state.peers.forEach((p) => {
     if (p.micSender) safeReplace(p.micSender, micTrack);
     else addLocalTracksToPeer(p);
@@ -967,10 +1011,24 @@ function preferVP9ForSender(sender) {
   } catch (_) {}
 }
 
+// In SFU mode a peer is a UI shell: media arrives on the single shared PC, so
+// every per-peer method still needs something harmless to call into.
+function sfuStubPc() {
+  return {
+    connectionState: 'connected',
+    iceConnectionState: 'connected',
+    signalingState: 'stable',
+    close() {}, addEventListener() {}, removeEventListener() {},
+    getSenders: () => [], getReceivers: () => [], getTransceivers: () => [],
+    addTrack: () => ({}), removeTrack() {},
+    getStats: async () => new Map(),
+  };
+}
+
 function getPeer(peerId, peerName) {
   let p = state.peers.get(peerId);
   if (p) { if (peerName) p.name = peerName; return p; }
-  const pc = new RTCPeerConnection(RTC_CONFIG);
+  const pc = state.sfu ? sfuStubPc() : new RTCPeerConnection(RTC_CONFIG);
   p = {
     id: peerId, name: peerName || nameOf(peerId), pc,
     makingOffer: false, ignoreOffer: false,
@@ -1001,6 +1059,7 @@ function getPeer(peerId, peerName) {
 
   // Attach any local tracks that already exist (mic / screen). Uses addTrack so
   // Chrome reuses the transceiver correctly on the answerer side.
+  if (state.sfu) return p;
   addLocalTracksToPeer(p);
   // Fallback: some headless timing edge-cases don't fire negotiationneeded
   // synchronously. Only fire if we still have an un-negotiated transceiver.
@@ -1278,6 +1337,71 @@ function cleanupPeers() {
   [...state.peers.keys()].forEach(closePeer);
 }
 
+/* ---------------- SFU media (one uplink for every viewer) ---------------- */
+function sfuAttachTrack(mid, track, receiver) {
+  const meta = sfuPublishers.get(mid);
+  if (!meta) { sfuTracks.set(mid, { track, receiver }); return; }
+  const p = getPeer(meta.publisherId, meta.name);
+  onRemoteTrack(p, { track, receiver });
+  renderAll();
+}
+
+function sfuStart() {
+  if (!state.sfu || sfuPc || !state.channelId) return;
+  sfuPc = new RTCPeerConnection(RTC_CONFIG);
+  sfuPc.ontrack = (e) => {
+    const mid = e.transceiver && e.transceiver.mid;
+    if (mid == null) return;
+    sfuAttachTrack(String(mid), e.track, e.receiver);
+  };
+  sfuPc.onicecandidate = (e) => { if (e.candidate) send({ type: 'sfu-candidate', candidate: e.candidate }); };
+  sfuPc.onnegotiationneeded = () => sfuNegotiate();
+  sfuSyncTracks();
+}
+
+async function sfuNegotiate() {
+  if (!sfuPc || sfuBusy) return;
+  try {
+    sfuBusy = true;
+    await sfuPc.setLocalDescription();
+    send({ type: 'sfu-offer', sdp: sfuPc.localDescription.sdp });
+  } catch (_) {
+  } finally { sfuBusy = false; }
+}
+
+// Publish whatever local tracks exist right now (mic, screen). Replacing a track
+// reuses its transceiver, so the server never has to renegotiate for a device swap.
+function sfuSyncTracks() {
+  if (!state.sfu) return;
+  if (!sfuPc) { sfuStart(); return; }
+  const wanted = [];
+  if (micTrack && micTrack.readyState === 'live') wanted.push(['mic', micTrack]);
+  if (screenVideoTrack) wanted.push(['screen', screenVideoTrack]);
+  let added = false;
+  for (const [slot, track] of wanted) {
+    const sender = sfuPublished.get(slot);
+    if (!sender) {
+      try { sfuPublished.set(slot, sfuPc.addTrack(track, new MediaStream([track]))); added = true; } catch (_) {}
+    } else if (sender.track !== track) {
+      try { sender.replaceTrack(track); } catch (_) {}
+    }
+  }
+  for (const [slot, sender] of [...sfuPublished]) {
+    if (wanted.some(([s]) => s === slot)) continue;
+    try { sender.replaceTrack(null); } catch (_) {}
+    sfuPublished.delete(slot);
+  }
+  if (added) sfuNegotiate();
+}
+
+function sfuStop() {
+  try { if (sfuPc) sfuPc.close(); } catch (_) {}
+  sfuPc = null;
+  sfuPublished.clear();
+  sfuPublishers.clear();
+  sfuTracks.clear();
+}
+
 /* ---------------- screen share ---------------- */
 async function toggleScreen() {
   if (screenStream) { stopScreen(); return; }
@@ -1356,6 +1480,7 @@ async function toggleScreen() {
     // Mic was interrupted — try to re-acquire silently
     ensureMic();
   }
+  if (state.sfu) sfuSyncTracks();
   send({ type: 'update', sharing: true });
   toast(screenAudioTrack ? 'Sharing screen with audio' : 'Sharing screen');
   renderAll();
@@ -1366,6 +1491,7 @@ function stopScreen(silent) {
   const hadVideo = !!screenVideoTrack;
   const hadAudio = !!screenAudioTrack;
   screenStream = null; screenVideoTrack = null; screenAudioTrack = null;
+  if (state.sfu) sfuSyncTracks();
   const meShare = shareEls.get('me');
   if (meShare) {
     if (fsElement() && fsElement() === meShare.card) exitFs();
