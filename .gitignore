@@ -5,3 +5,6 @@ node_modules/
 .DS_Store
 
 mockups/
+
+# local off-server copies of VPS backups (contain secrets)
+backups/
