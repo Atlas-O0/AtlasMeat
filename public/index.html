@@ -154,6 +154,14 @@
         </select>
       </label>
       <label class="field">
+        <span>Mode</span>
+        <select id="qualityMode">
+          <option value="smooth" selected>Smooth (video, games)</option>
+          <option value="sharp">Sharp (text, code)</option>
+        </select>
+      </label>
+      <p class="field-note">Smooth keeps the frame rate up and lowers resolution when the link is tight (like Discord). Sharp keeps text crisp but can look choppy on weak connections.</p>
+      <label class="field">
         <span>Bitrate <b id="bitrateVal">6 Mbps</b></span>
         <input id="qualityBitrate" type="range" min="500" max="50000" step="500" value="6000" />
       </label>

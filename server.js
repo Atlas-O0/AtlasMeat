@@ -250,6 +250,8 @@ try {
     );
     CREATE INDEX IF NOT EXISTS messages_channel_ts ON messages (channel_id, ts);
   `);
+  try { db.exec('ALTER TABLE messages ADD COLUMN edited INTEGER NOT NULL DEFAULT 0'); }
+  catch (_) { /* column already there */ }
   console.log('state store:', DB_PATH);
 } catch (e) {
   console.warn('state persistence disabled:', e.message);
@@ -273,8 +275,8 @@ function deleteChannelRows(id) {
 }
 function saveMessageRow(channelId, m) {
   dbRun(
-    'INSERT OR REPLACE INTO messages (id, channel_id, user_id, name, text, image, ts) VALUES (?, ?, ?, ?, ?, ?, ?)',
-    [m.id, channelId, m.userId || null, m.name || '', m.text || '', m.image || null, m.ts]
+    'INSERT OR REPLACE INTO messages (id, channel_id, user_id, name, text, image, ts, edited) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+    [m.id, channelId, m.userId || null, m.name || '', m.text || '', m.image || null, m.ts, m.edited ? 1 : 0]
   );
   dbRun(
     `DELETE FROM messages WHERE channel_id = ? AND id NOT IN (
@@ -287,15 +289,27 @@ function channelHistory(channelId) {
   if (!db) return [];
   try {
     const rows = db.prepare(
-      'SELECT id, user_id, name, text, image, ts FROM messages WHERE channel_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?'
+      'SELECT id, user_id, name, text, image, ts, edited FROM messages WHERE channel_id = ? ORDER BY ts DESC, rowid DESC LIMIT ?'
     ).all(channelId, MAX_CHAT);
     return rows.reverse().map((r) => {
       const m = { id: r.id, userId: r.user_id || '', name: r.name || '', text: r.text || '', ts: r.ts };
       if (r.image) m.image = r.image;
+      if (r.edited) m.edited = true;
       return m;
     });
   } catch (e) { console.warn('db read failed:', e.message); return []; }
 }
+// Drop the file behind a deleted image message, unless another message still
+// points at the same upload.
+function deleteUploadFile(imageRef) {
+  const name = path.basename(String(imageRef || ''));
+  if (!name || !UPLOAD_NAME_RE.test(`/uploads/${name}`)) return;
+  try {
+    if (db && db.prepare('SELECT 1 AS hit FROM messages WHERE image = ? LIMIT 1').get(`/uploads/${name}`)) return;
+    fs.unlinkSync(path.join(UPLOAD_DIR, name));
+  } catch (_) { /* already gone */ }
+}
+
 // Images whose message fell out of the history (or whose channel was deleted)
 // are invisible but still on disk, so sweep them once in a while. Files newer
 // than a day are kept: an upload that is still in flight has no message yet.
@@ -546,6 +560,10 @@ wss.on('connection', (ws) => {
         if (!id || !name) break;
         const ch = channels.get(id);
         if (!ch) { send(ws, { type: 'error', message: 'Channel not found.' }); break; }
+        if (user.channelId !== id) {
+          send(ws, { type: 'error', message: 'Join the channel first to rename it.' });
+          break;
+        }
         ch.name = name;
         saveChannelRow(ch);
         broadcastState();
@@ -560,6 +578,10 @@ wss.on('connection', (ws) => {
         if (!id) break;
         const ch = channels.get(id);
         if (!ch) break;
+        if (user.channelId !== id) {
+          send(ws, { type: 'error', message: 'Join the channel first to delete it.' });
+          break;
+        }
         // Prevent deleting the last channel
         if (channels.size <= 1) { send(ws, { type: 'error', message: 'Cannot delete the last channel.' }); break; }
         // Kick everyone out of this channel
@@ -630,6 +652,38 @@ wss.on('connection', (ws) => {
         if (ch.messages.length > MAX_CHAT) ch.messages.splice(0, ch.messages.length - MAX_CHAT);
         saveMessageRow(user.channelId, message);
         broadcastChannel(user.channelId, { type: 'chat', channelId: user.channelId, message });
+        break;
+      }
+      case 'edit-message': {
+        const id = String(msg.id || '');
+        const text = String(msg.text || '').trim().slice(0, 1000);
+        if (!id || !text || !user.channelId) break;
+        const ch = channels.get(user.channelId);
+        if (!ch) break;
+        const m = ch.messages.find((x) => x.id === id);
+        if (!m) { send(ws, { type: 'chat-action-error', id, message: 'That message no longer exists.' }); break; }
+        if (m.userId !== user.id) { send(ws, { type: 'chat-action-error', id, message: 'You can only edit your own messages.' }); break; }
+        if (m.image) { send(ws, { type: 'chat-action-error', id, message: 'Images cannot be edited — delete and send a new one.' }); break; }
+        if (m.text === text) break;
+        m.text = text;
+        m.edited = true;
+        saveMessageRow(user.channelId, m);
+        broadcastChannel(user.channelId, { type: 'chat-edited', channelId: user.channelId, id, text, edited: true });
+        break;
+      }
+      case 'delete-message': {
+        const id = String(msg.id || '');
+        if (!id || !user.channelId) break;
+        const ch = channels.get(user.channelId);
+        if (!ch) break;
+        const idx = ch.messages.findIndex((x) => x.id === id);
+        if (idx === -1) break;
+        const m = ch.messages[idx];
+        if (m.userId !== user.id) { send(ws, { type: 'chat-action-error', id, message: 'You can only delete your own messages.' }); break; }
+        ch.messages.splice(idx, 1);
+        dbRun('DELETE FROM messages WHERE id = ?', [id]);
+        if (m.image) deleteUploadFile(m.image);
+        broadcastChannel(user.channelId, { type: 'chat-deleted', channelId: user.channelId, id });
         break;
       }
       default:

@@ -181,9 +181,10 @@ function quality() {
     return {
       res: q.res || '1920x1080',
       fps: Number(q.fps) || 30,
-      bitrate: Number(q.bitrate) || 6000, // kbps
+      bitrate: Number(q.bitrate) || 6000, // kbps, split across peers
+      mode: q.mode === 'sharp' ? 'sharp' : 'smooth',
     };
-  } catch (_) { return { res: '1920x1080', fps: 30, bitrate: 6000 }; }
+  } catch (_) { return { res: '1920x1080', fps: 30, bitrate: 6000, mode: 'smooth' }; }
 }
 function saveQuality(q) { try { localStorage.setItem('atlasmeat:quality', JSON.stringify(q)); } catch (_) {} }
 function audioProc() {
@@ -437,6 +438,35 @@ function route(msg) {
           setTimeout(()=>{ document.title = orig; }, 3000);
         }
       }
+      break;
+    case 'chat-edited': {
+      if (msg.channelId !== state.channelId) break;
+      const row = findMsgEl(msg.id);
+      if (!row) break;
+      const textEl = row.querySelector('.msg-text');
+      if (textEl) textEl.textContent = msg.text;
+      if (!row.querySelector('.msg-edited')) {
+        const time = row.querySelector('.msg-time');
+        if (time) {
+          const tag = document.createElement('span');
+          tag.className = 'msg-edited';
+          tag.textContent = ' (edited)';
+          time.appendChild(tag);
+        }
+      }
+      break;
+    }
+    case 'chat-deleted': {
+      if (msg.channelId !== state.channelId) break;
+      const row = findMsgEl(msg.id);
+      if (row) {
+        row.classList.add('removing');
+        setTimeout(() => row.remove(), 160);
+      }
+      break;
+    }
+    case 'chat-action-error':
+      toast(msg.message || 'Could not update that message.', true);
       break;
     case 'channel-deleted': {
       channelPasswords.delete(msg.channelId);
@@ -964,6 +994,10 @@ function getPeer(peerId, peerName) {
   };
   pc.onnegotiationneeded = () => negotiate(p);
   pc.ontrack = (e) => onRemoteTrack(p, e);
+  // Encoder parameters can only be set on a live sender.
+  pc.addEventListener('connectionstatechange', () => {
+    if (pc.connectionState === 'connected' && screenVideoTrack) applyVideoBitrate(p);
+  });
 
   // Attach any local tracks that already exist (mic / screen). Uses addTrack so
   // Chrome reuses the transceiver correctly on the answerer side.
@@ -975,6 +1009,7 @@ function getPeer(peerId, peerName) {
     const needsOffer = p.pc.getTransceivers().some((t) => t.currentDirection == null);
     if (needsOffer) negotiate(p);
   }, 400);
+  applyVideoBitrateAll();
   return p;
 }
 
@@ -988,19 +1023,7 @@ function addLocalTracksToPeer(p) {
   try {
     if (screenVideoTrack && !p.screenVideoSender) {
       p.screenVideoSender = pc.addTrack(screenVideoTrack, new MediaStream([screenVideoTrack]));
-      // Prefer VP9 for screen content (sharper text at lower bitrate)
-      try {
-        const caps = RTCRtpReceiver.getCapabilities('video');
-        if (caps && caps.codecs) {
-          const vp9 = caps.codecs.filter((c) => /VP9/i.test(c.mimeType));
-          const h264 = caps.codecs.filter((c) => /H264/i.test(c.mimeType));
-          const rest = caps.codecs.filter((c) => !/VP9|H264/i.test(c.mimeType));
-          if (vp9.length || h264.length) {
-            const tr = pc.getTransceivers().find((t) => t.sender === p.screenVideoSender);
-            if (tr && tr.setCodecPreferences) tr.setCodecPreferences([...vp9, ...h264, ...rest]);
-          }
-        }
-      } catch (_) {}
+      preferScreenCodecs(pc, p.screenVideoSender);
       applyVideoBitrate(p);
     }
   } catch (e) { console.warn('add video track', e); }
@@ -1180,6 +1203,23 @@ function safeReplace(sender, track) {
   } catch (_) {}
 }
 
+// Smooth mode leans on hardware H.264 (cheap to encode, low latency, consistent
+// frame rate); sharp mode prefers VP9, which keeps text legible at lower bitrates.
+function preferScreenCodecs(pc, sender) {
+  try {
+    const caps = RTCRtpReceiver.getCapabilities('video');
+    if (!caps || !caps.codecs) return;
+    const q = quality();
+    const vp9 = caps.codecs.filter((c) => /VP9/i.test(c.mimeType));
+    const h264 = caps.codecs.filter((c) => /H264/i.test(c.mimeType));
+    const rest = caps.codecs.filter((c) => !/VP9|H264/i.test(c.mimeType));
+    if (!vp9.length && !h264.length) return;
+    const order = q.mode === 'sharp' ? [...vp9, ...h264, ...rest] : [...h264, ...vp9, ...rest];
+    const tr = pc.getTransceivers().find((t) => t.sender === sender);
+    if (tr && tr.setCodecPreferences) tr.setCodecPreferences(order);
+  } catch (_) {}
+}
+
 function applyVideoBitrate(p) {
   // Find the active video sender (screen share) regardless of stored reference
   let sender = p.screenVideoSender;
@@ -1192,15 +1232,32 @@ function applyVideoBitrate(p) {
     } catch (_) { sender = p.screenVideoSender; }
   }
   if (!sender || typeof sender.getParameters !== 'function') return;
-  const bps = quality().bitrate * 1000;
+  const q = quality();
+  // Mesh: every viewer receives its own copy of the stream, so the configured
+  // bitrate is a budget for the whole uplink, not per peer. Without this, three
+  // viewers at 6 Mbps means an 18 Mbps upload and everything starts stuttering.
+  const peers = Math.max(1, state.peers.size);
+  const perPeer = Math.max(1200, Math.round(q.bitrate / peers));
+  const bps = perPeer * 1000;
   Promise.resolve()
     .then(() => sender.getParameters())
     .then((params) => {
       params.encodings = params.encodings && params.encodings.length ? params.encodings : [{}];
       params.encodings[0].maxBitrate = bps;
+      params.encodings[0].maxFramerate = q.fps;
+      // Smooth: keep the frame rate, trade resolution (Discord-style). Sharp:
+      // keep pixels crisp even if the frame rate dips.
+      params.degradationPreference = q.mode === 'sharp' ? 'maintain-resolution' : 'maintain-framerate';
+      try { if (sender.track) sender.track.contentHint = q.mode === 'sharp' ? 'detail' : 'motion'; } catch (_) {}
       return sender.setParameters(params);
     })
     .catch(() => {});
+}
+
+// Re-split the uplink budget whenever the number of viewers changes.
+function applyVideoBitrateAll() {
+  if (!screenVideoTrack) return;
+  state.peers.forEach((p) => applyVideoBitrate(p));
 }
 
 function closePeer(peerId) {
@@ -1258,7 +1315,9 @@ async function toggleScreen() {
   screenAudioTrack = stream.getAudioTracks()[0] || null;
 
   if (screenVideoTrack) {
-    try { screenVideoTrack.contentHint = 'detail'; } catch (_) {}
+    // 'motion' tells the encoder to keep motion fluid (gaming/video); 'detail'
+    // spends bits on sharpness (code, text).
+    try { screenVideoTrack.contentHint = q.mode === 'sharp' ? 'detail' : 'motion'; } catch (_) {}
     try {
       await screenVideoTrack.applyConstraints({
         width: { ideal: w }, height: { ideal: h }, frameRate: { ideal: q.fps },
@@ -1273,18 +1332,7 @@ async function toggleScreen() {
     try {
       if (screenVideoTrack && !p.screenVideoSender) {
         p.screenVideoSender = p.pc.addTrack(screenVideoTrack, screenStream);
-        try {
-          const caps = RTCRtpReceiver.getCapabilities('video');
-          if (caps && caps.codecs) {
-            const vp9 = caps.codecs.filter((c) => /VP9/i.test(c.mimeType));
-            const h264 = caps.codecs.filter((c) => /H264/i.test(c.mimeType));
-            const rest = caps.codecs.filter((c) => !/VP9|H264/i.test(c.mimeType));
-            if (vp9.length || h264.length) {
-              const tr = p.pc.getTransceivers().find((t) => t.sender === p.screenVideoSender);
-              if (tr && tr.setCodecPreferences) tr.setCodecPreferences([...vp9, ...h264, ...rest]);
-            }
-          }
-        } catch (_) {}
+        preferScreenCodecs(p.pc, p.screenVideoSender);
       } else if (screenVideoTrack && p.screenVideoSender) {
         safeReplace(p.screenVideoSender, screenVideoTrack);
       }
@@ -1660,9 +1708,13 @@ function detectMemberChanges() {
 }
 
 /* ---------------- chat ---------------- */
+const ICON_EDIT = '<svg viewBox="0 0 24 24"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>';
+const ICON_TRASH = '<svg viewBox="0 0 24 24"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v5M14 11v5"/></svg>';
+
 function msgEl(m) {
   const div = document.createElement('div');
   div.className = 'msg' + (m.sys ? ' sys' : '');
+  if (m.id) div.dataset.mid = m.id;
   const text = document.createElement('div');
   text.className = 'msg-text';
   text.textContent = m.text;
@@ -1679,11 +1731,103 @@ function msgEl(m) {
   const time = document.createElement('span');
   time.className = 'msg-time';
   time.textContent = timeStr(m.ts);
+  if (m.edited) {
+    const tag = document.createElement('span');
+    tag.className = 'msg-edited';
+    tag.textContent = ' (edited)';
+    time.appendChild(tag);
+  }
   head.appendChild(name); head.appendChild(time);
   div.appendChild(head);
   if (m.image) div.appendChild(imageEl(m.image));
   if (m.text) div.appendChild(text);
+  if (m.userId && m.userId === myId) div.appendChild(msgActions(m, text));
   return div;
+}
+
+/* ---------------- edit / delete own messages ---------------- */
+function findMsgEl(id) {
+  return id ? $(`.msg[data-mid="${CSS.escape(id)}"]`) : null;
+}
+
+function msgActions(m, textNode) {
+  const bar = document.createElement('div');
+  bar.className = 'msg-actions';
+  // Images can only be deleted; text messages can be edited too.
+  if (!m.image) {
+    const edit = document.createElement('button');
+    edit.type = 'button';
+    edit.className = 'msg-action';
+    edit.title = 'Edit message';
+    edit.setAttribute('aria-label', 'Edit message');
+    edit.innerHTML = ICON_EDIT;
+    edit.addEventListener('click', () => startEditMsg(m, textNode, bar));
+    bar.appendChild(edit);
+  }
+  const del = document.createElement('button');
+  del.type = 'button';
+  del.className = 'msg-action danger';
+  del.title = 'Delete message';
+  del.setAttribute('aria-label', 'Delete message');
+  del.innerHTML = ICON_TRASH;
+  del.addEventListener('click', () => deleteMsg(m));
+  bar.appendChild(del);
+  return bar;
+}
+
+function startEditMsg(m, textNode, bar) {
+  const row = findMsgEl(m.id);
+  if (!row || row.querySelector('.msg-edit')) return;
+  const wrap = document.createElement('div');
+  wrap.className = 'msg-edit';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.maxLength = 1000;
+  input.value = m.text;
+  const hint = document.createElement('div');
+  hint.className = 'msg-edit-hint';
+  hint.textContent = 'Enter to save · Esc to cancel';
+  wrap.appendChild(input);
+  wrap.appendChild(hint);
+  textNode.replaceWith(wrap);
+  bar.classList.add('hidden');
+  input.focus();
+  input.select();
+  let finished = false;
+  const finish = (save) => {
+    if (finished) return;
+    finished = true;
+    wrap.replaceWith(textNode);
+    bar.classList.remove('hidden');
+    if (!save) return;
+    const value = input.value.trim().slice(0, 1000);
+    if (!value || value === m.text) return;
+    m.text = value;
+    m.edited = true;
+    textNode.textContent = value;
+    if (!row.querySelector('.msg-edited')) {
+      const time = row.querySelector('.msg-time');
+      if (time) {
+        const tag = document.createElement('span');
+        tag.className = 'msg-edited';
+        tag.textContent = ' (edited)';
+        time.appendChild(tag);
+      }
+    }
+    send({ type: 'edit-message', id: m.id, text: value });
+  };
+  input.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); finish(true); }
+    else if (e.key === 'Escape') { e.preventDefault(); finish(false); }
+  });
+  input.addEventListener('blur', () => finish(true));
+}
+
+function deleteMsg(m) {
+  if (!m.id) return;
+  const what = m.image ? 'this image' : 'this message';
+  if (!window.confirm(`Delete ${what} for everyone?`)) return;
+  send({ type: 'delete-message', id: m.id });
 }
 function appendMsg(m) {
   const box = $('#messages');
@@ -2135,6 +2279,7 @@ function openQuality() {
   const q = quality();
   $('#qualityRes').value = q.res;
   $('#qualityFps').value = String(q.fps);
+  $('#qualityMode').value = q.mode;
   $('#qualityBitrate').value = String(q.bitrate);
   $('#bitrateVal').textContent = fmtBitrate(q.bitrate);
   const proc = audioProc();
@@ -2156,6 +2301,7 @@ $('#qualityApply').addEventListener('click', async () => {
     res: $('#qualityRes').value,
     fps: Number($('#qualityFps').value),
     bitrate: Number($('#qualityBitrate').value),
+    mode: $('#qualityMode').value === 'sharp' ? 'sharp' : 'smooth',
   };
   saveQuality(q);
   const newProc = {
